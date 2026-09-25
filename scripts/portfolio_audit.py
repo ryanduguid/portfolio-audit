@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from http.client import HTTPMessage
@@ -32,6 +32,7 @@ MAX_RAW_WORKFLOW_BYTES = 1024 * 1024
 MAX_WORKFLOWS_PER_REPOSITORY = 50
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 WORKFLOW_PREFIX = ".github/workflows/"
+AUDIT_WORKFLOW_PATH = WORKFLOW_PREFIX + "portfolio-audit.yml"
 
 POLICY_KEYS = {
     "schema_version",
@@ -270,6 +271,7 @@ class WorkflowRun:
     path: str
     conclusion: str
     created_at: datetime = datetime.min.replace(tzinfo=UTC)
+    audit_enforcement_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -922,6 +924,53 @@ def _normalise_runs(
     return tuple(sorted(normalised, key=_run_order, reverse=True))
 
 
+def _audit_enforcement_only(raw: object, run_id: int) -> bool:
+    """Keep prior audit results separate from audit infrastructure failures."""
+    if (
+        not isinstance(raw, dict)
+        or type(raw.get("total_count")) is not int
+        or not isinstance(raw.get("jobs"), list)
+        or not all(isinstance(job, dict) for job in raw["jobs"])
+    ):
+        raise ResponseError("audit jobs response omitted required fields")
+    jobs = raw["jobs"]
+    expected = {
+        "invocation_guard": {"success"}, "collect": {"success"},
+        "deliver": {"success", "skipped"}, "enforce": {"failure"},
+    }
+    # Any missing, additional or renamed job retains the failed-run finding.
+    if raw["total_count"] != len(expected) or len(jobs) != len(expected):
+        return False
+    seen = set()
+    for job in jobs:
+        name = job.get("name")
+        if (
+            not isinstance(name, str) or name not in expected or name in seen
+            or job.get("run_id") != run_id or job.get("status") != "completed"
+            or not isinstance(job.get("conclusion"), str)
+            or job.get("conclusion") not in expected[name]
+        ):
+            return False
+        seen.add(name)
+        if name == "enforce":
+            steps = job.get("steps")
+            if not isinstance(steps, list) or not steps:
+                return False
+            failed_steps = []
+            for step in steps:
+                if (
+                    not isinstance(step, dict) or step.get("status") != "completed"
+                    or not isinstance(step.get("conclusion"), str)
+                    or step.get("conclusion") not in {"success", "failure"}
+                ):
+                    return False
+                if step["conclusion"] == "failure":
+                    failed_steps.append(step.get("name"))
+            if failed_steps != ["Enforce report and requested delivery"]:
+                return False
+    return True
+
+
 def _collect_tagged_release_run(
     repository_path: str, workflow: str, prefix: str, client: GitHubClient,
 ) -> WorkflowRun | None:
@@ -1061,6 +1110,20 @@ def _collect_repository(
         if run is not None:
             workflow_runs += (run,)
     workflow_runs = tuple(sorted(workflow_runs, key=_run_order, reverse=True))
+    if name.casefold() == "portfolio-audit":
+        run = next((item for item in workflow_runs if item.path == AUDIT_WORKFLOW_PATH), None)
+        if run is not None and run.conclusion == "failure":
+            enforcement_only = _audit_enforcement_only(
+                client.get_json(
+                    f"{repository_path}/actions/runs/{run.run_id}/jobs",
+                    {"filter": "latest", "per_page": 100},
+                ),
+                run.run_id,
+            )
+            workflow_runs = tuple(
+                replace(item, audit_enforcement_only=enforcement_only) if item is run else item
+                for item in workflow_runs
+            )
     dependabot_pull_requests = _normalise_dependabot_pull_requests(
         client.paginate(
             f"{repository_path}/pulls", {"state": "open", "per_page": 100}
@@ -1114,11 +1177,14 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
         len(policy.tagged_release_workflows.get(name, {}))
         for name, _default_branch in active_repositories
     )
+    audit_job_request = int(any(name.casefold() == "portfolio-audit" for name in discovered))
     try:
         # Each tagged workflow adds a run query, bounded tag pagination and
-        # a branch-disambiguation request; retain the existing rate headroom.
+        # a branch-disambiguation request. Reserve the conditional audit jobs
+        # query too, retaining the existing rate headroom.
         client.require_capacity(
             len(active_repositories) * 3 + tagged_workflow_count * (MAX_PAGES + 2)
+            + audit_job_request
         )
     except RateLimitError:
         problems.append(_problem("GITHUB_RATE_LIMITED"))
@@ -1387,10 +1453,13 @@ def evaluate(
                 _positive_integer(run.run_id, "workflow run id")
                 findings.append(
                     Finding(
-                        Severity.ACTION,
+                        Severity.NOTICE if run.audit_enforcement_only else Severity.ACTION,
                         repository.name,
-                        "WORKFLOW_RUN_FAILED",
-                        "latest completed workflow run failed",
+                        "AUDIT_ENFORCEMENT_FAILED" if run.audit_enforcement_only else "WORKFLOW_RUN_FAILED",
+                        (
+                            "previous audit failed only in enforcement; current findings are evaluated separately"
+                            if run.audit_enforcement_only else "latest completed workflow run failed"
+                        ),
                         f"{repository_url}/actions/runs/"
                         f"{_quote_component(str(run.run_id))}",
                     )
