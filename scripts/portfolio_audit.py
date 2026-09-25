@@ -1177,11 +1177,14 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
         len(policy.tagged_release_workflows.get(name, {}))
         for name, _default_branch in active_repositories
     )
+    audit_job_request = int(any(name.casefold() == "portfolio-audit" for name in discovered))
     try:
         # Each tagged workflow adds a run query, bounded tag pagination and
-        # a branch-disambiguation request; retain the existing rate headroom.
+        # a branch-disambiguation request. Reserve the conditional audit jobs
+        # query too, retaining the existing rate headroom.
         client.require_capacity(
             len(active_repositories) * 3 + tagged_workflow_count * (MAX_PAGES + 2)
+            + audit_job_request
         )
     except RateLimitError:
         problems.append(_problem("GITHUB_RATE_LIMITED"))

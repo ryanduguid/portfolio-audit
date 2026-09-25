@@ -66,6 +66,7 @@ class AuditSelfCheckTests(unittest.TestCase):
         conclusion: str = "failure",
         runs: list[dict[str, object]] | None = None,
         jobs_response: HttpResponse | None = None,
+        remaining: int = 4999,
     ) -> tuple[AuditReport, FakeTransport]:
         if runs is None:
             runs = [workflow_run(42, path=path, branch="main", conclusion=conclusion)]
@@ -84,7 +85,7 @@ class AuditSelfCheckTests(unittest.TestCase):
                 parsed = urlsplit(url)
                 base = f"/repos/ryanduguid/{name}"
                 if parsed.path == "/users/ryanduguid/repos":
-                    return api_response([{**public_repo(), "name": name}])
+                    return api_response([{**public_repo(), "name": name}], remaining=remaining)
                 if parsed.path == base + "/git/trees/main":
                     return api_response({"truncated": False, "tree": tree})
                 if parsed.hostname == "raw.githubusercontent.com":
@@ -104,6 +105,19 @@ class AuditSelfCheckTests(unittest.TestCase):
         result = collect_estate(policy, GitHubClient("TOKEN-SENTINEL", transport=transport))
         now = datetime(2026, 9, 25, tzinfo=UTC)
         return build_report(policy, result, evaluate(policy, result, now), now, now), transport
+
+    def test_preflight_reserves_the_conditional_jobs_request(self) -> None:
+        for name in ("portfolio-audit", "PORTFOLIO-AUDIT"):
+            report, transport = self.audit(audit_jobs(), name=name, remaining=103)
+            self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+            self.assertEqual(
+                [error.code for error in report.collection_errors], ["GITHUB_RATE_LIMITED"]
+            )
+            self.assertEqual(len(transport.requests), 1)
+        report, _ = self.audit(audit_jobs(), remaining=104)
+        self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
+        report, _ = self.audit(audit_jobs(), name="example", conclusion="success", remaining=103)
+        self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
 
     def test_enforcement_only_failure_is_a_notice(self) -> None:
         for delivery in ("skipped", "success"):
