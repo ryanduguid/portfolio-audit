@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "owner": "ryanduguid",
+  "expected_repositories": [
+    ".github",
+    "accounting-review-pipeline",
+    "au-fpa-pack",
+    "au-tax-legislation-corpus",
+    "australian-accounting",
+    "australian-accounting-skills",
+    "github-agent-skills",
+    "llm-tax-guardrails",
+    "Metanoia",
+    "Ozzit",
+    "planning-analytics-model",
+    "portfolio-audit",
+    "release-policy",
+    "ryanduguid",
+    "ryanduguid.github.io"
+  ],
+  "baseline_exemptions": {
+    "workflow": {},
+    "dependabot": {}
+  },
+  "dependabot_max_age_days": 14,
+  "tagged_release_workflows": {
+    "australian-accounting": {
+      "release-aus-accounting-mcp.yml": "aus-accounting-mcp/v"
+    }
+  },
+  "release_policy_pins": {
+    "attribution-policy.yml": [
+      "5ed71fcec40429bb44640aee8c041c34be3c2f43",
+      "0fab5177a2736b2919a83b433f70636bcab04472",
+      "8e33d7135b61a17aac7ae7af5942cdee35902b52",
+      "ad021fa20ac5e4ba94a5a2c200e7ae2a2d3b0e3b",
+      "b2ee72f46001557822b9d6095b2d33f4d119042b",
+      "711d9e628531e4c2b27a706689995337663b56a9"
+    ],
+    "release-archive.yml": [
+      "787db4590e725cfd37104c8a9dd9e75f7fd4c018",
+      "47480b782926179b621ec1c6643ef88c80fc8fd4",
+      "2fe690d8dbb90c9b680c43822b7819f6aa1408ff",
+      "fca32335275ee264799644ccd659b025358dd23c",
+      "fcf25e532e9eb60056ae6e5c819cf3125c4f4b91",
+      "99a6314ca2cd4ea21b465614b73d108fd8fe2077",
+      "2adf9e19b7c73970a1dd6703afb3f9c27b7972d7",
+      "171aa487dbc0a8f437ed84407f0d506f814548c1",
+      "87767ec809dc7f77bcd45808219adaf67841ae7b"
+    ],
+    "release-python.yml": [
+      "ff86e30038ca4fd028ce3663646ee03ae5e94692",
+      "787db4590e725cfd37104c8a9dd9e75f7fd4c018",
+      "3b8a377207cab2c7c808fcc96b66578f4695beea",
+      "d08de09646fc46b43d3e59394105005c123496bb",
+      "2fe690d8dbb90c9b680c43822b7819f6aa1408ff",
+      "fcf25e532e9eb60056ae6e5c819cf3125c4f4b91",
+      "2adf9e19b7c73970a1dd6703afb3f9c27b7972d7",
+      "5ed71fcec40429bb44640aee8c041c34be3c2f43",
+      "0fab5177a2736b2919a83b433f70636bcab04472",
+      "87767ec809dc7f77bcd45808219adaf67841ae7b"
+    ],
+    "release-skills.yml": [
+      "787db4590e725cfd37104c8a9dd9e75f7fd4c018",
+      "d08de09646fc46b43d3e59394105005c123496bb",
+      "2fe690d8dbb90c9b680c43822b7819f6aa1408ff",
+      "99a6314ca2cd4ea21b465614b73d108fd8fe2077",
+      "2adf9e19b7c73970a1dd6703afb3f9c27b7972d7",
+      "87767ec809dc7f77bcd45808219adaf67841ae7b"
+    ],
+    "verify-skills.yml": [
+      "787db4590e725cfd37104c8a9dd9e75f7fd4c018",
+      "d08de09646fc46b43d3e59394105005c123496bb",
+      "2fe690d8dbb90c9b680c43822b7819f6aa1408ff",
+      "99a6314ca2cd4ea21b465614b73d108fd8fe2077",
+      "171aa487dbc0a8f437ed84407f0d506f814548c1",
+      "87767ec809dc7f77bcd45808219adaf67841ae7b"
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+# Development and CI dependencies. portfolio-tests.yml installs this file, so
+# the pins here are the versions the checks run against.
+PyYAML==6.0.3
+ruff==0.16.6
+mypy==2.3.1
