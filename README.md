@@ -42,6 +42,19 @@ Creation time orders results, so a rerun of an older release cannot hide a newer
 failure. A newer default-branch failure still takes precedence. Failed eligible
 runs remain action findings; cancelled, skipped and neutral runs remain notices.
 
+The audit's own `portfolio-audit.yml` run needs a separate check because its
+enforcement job fails when the report contains findings. For the latest failed
+run, the collector reads the latest attempt's jobs. A failure becomes an
+`AUDIT_ENFORCEMENT_FAILED` notice only when all 4 expected jobs are present,
+the invocation guard and collection succeeded, delivery succeeded or was
+skipped, and the only failed enforcement step was `Enforce report and requested
+delivery`. The original run remains failed. The current report evaluates the
+estate again, so prior enforcement does not create a recurring action finding.
+This notice does not establish that the prior report was complete or clear.
+Operational failures and unexpected job or step results remain action findings;
+unavailable or malformed job evidence produces `INCOMPLETE`. This adds at most
+one API request and does not change enforcement or email delivery.
+
 `ALL_CLEAR` means collection completed with no action findings; it can include
 notices. The bounded run windows do not prove that an older workflow never ran,
 and successful runs do not replace release-asset or attestation verification.
