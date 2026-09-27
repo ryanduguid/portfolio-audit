@@ -51,23 +51,11 @@ FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TAG_PREFIX_RE = re.compile(r"(?:[a-z0-9]+(?:-[a-z0-9]+)*/)?v")
 VERSION_SUFFIX_RE = r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 PR_EVENTS = frozenset({"pull_request", "pull_request_target", "merge_group"})
-ALLOWED_CONCLUSIONS = frozenset(
-    {
-        "success",
-        "failure",
-        "timed_out",
-        "action_required",
-        "startup_failure",
-        "stale",
-        "cancelled",
-        "skipped",
-        "neutral",
-    }
-)
 FAILED_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "action_required", "startup_failure", "stale"}
 )
 NOTICE_CONCLUSIONS = frozenset({"cancelled", "skipped", "neutral"})
+ALLOWED_CONCLUSIONS = FAILED_CONCLUSIONS | NOTICE_CONCLUSIONS | {"success"}
 RELEASE_POLICY_PATH = "ryanduguid/release-policy/.github/workflows/"
 RELEASE_POLICY_USES_LINE_RE = re.compile(
     r"^\s*(?:-\s*)?uses\s*:\s*(?P<value>.*?)\s*$",
@@ -881,6 +869,15 @@ def _normalise_tree_path(value: object) -> str:
     return value
 
 
+def _is_workflow_file(path: str) -> bool:
+    """A YAML file directly under .github/workflows/, the only place Actions reads."""
+    return (
+        path.startswith(WORKFLOW_PREFIX)
+        and path.lower().endswith((".yml", ".yaml"))
+        and len(path.split("/")) == 3
+    )
+
+
 def _quote_component(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
@@ -963,12 +960,9 @@ def _result(
 def _normalise_repository(raw: Mapping[str, Any]) -> tuple[str, str, bool]:
     name = _normalise_repository_name(raw.get("name"))
     default_branch = _normalise_default_branch(raw.get("default_branch"))
-    flags: list[bool] = []
-    for flag_name in ("private", "fork", "archived"):
-        value = raw.get(flag_name)
-        if type(value) is not bool:
-            raise ResponseError("repository visibility fields were invalid")
-        flags.append(value)
+    flags = [raw.get(flag_name) for flag_name in ("private", "fork", "archived")]
+    if any(type(flag) is not bool for flag in flags):
+        raise ResponseError("repository visibility fields were invalid")
     active = not any(flags)
     return name, default_branch, active
 
@@ -998,11 +992,7 @@ def _normalise_tree(
             raise ResponseError("Git tree entry type was invalid")
         if entry_type == "blob":
             paths.add(path)
-        if (
-            path.startswith(".github/workflows/")
-            and path.lower().endswith((".yml", ".yaml"))
-            and len(path.split("/")) == 3
-        ):
+        if _is_workflow_file(path):
             workflow_path = _normalise_workflow_path(path)
             sha = entry.get("sha")
             if (
@@ -1633,9 +1623,7 @@ def evaluate(
                 (
                     path
                     for path in repository.paths
-                    if path.startswith(WORKFLOW_PREFIX)
-                    and path.lower().endswith((".yml", ".yaml"))
-                    and len(path.split("/")) == 3
+                    if _is_workflow_file(path)
                 ),
                 key=str.casefold,
             )
@@ -1689,7 +1677,6 @@ def evaluate(
                     )
                 )
             elif run.conclusion in FAILED_CONCLUSIONS:
-                _positive_integer(run.run_id, "workflow run id")
                 findings.append(
                     Finding(
                         Severity.NOTICE if run.audit_enforcement_only else Severity.ACTION,
@@ -1704,7 +1691,6 @@ def evaluate(
                     )
                 )
             elif run.conclusion in NOTICE_CONCLUSIONS:
-                _positive_integer(run.run_id, "workflow run id")
                 findings.append(
                     Finding(
                         Severity.NOTICE,
@@ -1718,7 +1704,6 @@ def evaluate(
 
         for pull_request in repository.dependabot_pull_requests:
             if now - pull_request.created_at > stale_threshold:
-                _positive_integer(pull_request.number, "pull request number")
                 findings.append(
                     Finding(
                         Severity.ACTION,

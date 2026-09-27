@@ -47,8 +47,6 @@ class MailConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(config.email, "audit@example.invalid")
-        self.assertEqual(config.host, "smtp.protonmail.ch")
-        self.assertEqual(config.port, 587)
 
     def test_rejects_missing_email_or_token(self) -> None:
         with self.assertRaisesRegex(MailConfigError, "mail configuration"):

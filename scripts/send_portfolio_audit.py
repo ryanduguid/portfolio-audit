@@ -24,8 +24,6 @@ ALLOWED_STATUSES = frozenset({"ALL_CLEAR", "ACTION_REQUIRED", "INCOMPLETE"})
 class MailConfig:
     email: str
     smtp_token: str
-    host: str = SMTP_HOST
-    port: int = SMTP_PORT
 
 
 class MailConfigError(ValueError):
@@ -143,8 +141,8 @@ def send_report(
 ) -> None:
     context = ssl.create_default_context()
     with smtp_factory(
-        config.host,
-        config.port,
+        SMTP_HOST,
+        SMTP_PORT,
         timeout=SMTP_TIMEOUT_SECONDS,
     ) as smtp:
         smtp.ehlo()
