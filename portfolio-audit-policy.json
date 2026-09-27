@@ -205,7 +205,14 @@
         }
       }
     },
-    "deferrals": {}
+    "deferrals": {
+      "australian-accounting-skills": {
+        "release.yml": {
+          "reason": "v0.3.0 is in preparation on main; its closed evaluation run is due on or after 29 September 2026",
+          "review_by": "2026-10-13"
+        }
+      }
+    }
   },
   "release_policy_pins": {
     "attribution-policy.yml": [
@@ -217,7 +224,8 @@
       "711d9e628531e4c2b27a706689995337663b56a9",
       "c228c644621f8255dc3300668660dfeeb2ab0778",
       "13b955c8eb1b67815b55970f1c6bf47ae48a79f0",
-      "a9d69e126a125e1786e7c047ee148122e4aa183f"
+      "a9d69e126a125e1786e7c047ee148122e4aa183f",
+      "cf95dd2362f0fa3d317b331aaf2881dde3d92add"
     ],
     "release-archive.yml": [
       "787db4590e725cfd37104c8a9dd9e75f7fd4c018",
