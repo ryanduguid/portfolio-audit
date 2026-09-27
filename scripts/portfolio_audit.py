@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -14,11 +15,13 @@ import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from http.client import HTTPMessage
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
+
+import tomllib
 
 API_ROOT = "https://api.github.com"
 MAX_ACTIVE_REPOSITORIES = 100
@@ -238,6 +241,18 @@ SEVERITY_ORDER = {Severity.ACTION: 0, Severity.NOTICE: 1}
 
 
 @dataclass(frozen=True)
+class ReleaseComponent:
+    paths: tuple[str, ...]
+    version_file: str
+
+
+@dataclass(frozen=True)
+class ReleaseDeferral:
+    reason: str
+    review_by: date
+
+
+@dataclass(frozen=True)
 class Policy:
     schema_version: int
     owner: str
@@ -247,6 +262,12 @@ class Policy:
     dependabot_max_age_days: int
     release_policy_pins: dict[str, frozenset[str]]
     tagged_release_workflows: dict[str, dict[str, str]] = field(default_factory=dict)
+    # The release queue: each tagged workflow's package paths and version file,
+    # how long a package change may wait for a release, and components
+    # deliberately left unreleased until a review date.
+    release_max_age_days: int = 7
+    release_components: dict[str, dict[str, ReleaseComponent]] = field(default_factory=dict)
+    release_deferrals: dict[str, dict[str, ReleaseDeferral]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -281,6 +302,20 @@ class DependabotPullRequest:
 
 
 @dataclass(frozen=True)
+class ReleaseBacklog:
+    """A component's declared version and oldest package change against its latest release tag."""
+
+    workflow: str
+    version_file: str
+    version: str
+    tag: str | None
+    tag_sha: str | None = None
+    version_tagged: bool = False
+    oldest_sha: str | None = None
+    oldest_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class RepositorySnapshot:
     name: str
     default_branch: str
@@ -288,6 +323,7 @@ class RepositorySnapshot:
     workflow_sources: dict[str, str]
     workflow_runs: tuple[WorkflowRun, ...]
     dependabot_pull_requests: tuple[DependabotPullRequest, ...]
+    release_backlogs: tuple[ReleaseBacklog, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -376,6 +412,76 @@ def _require_tagged_release_workflows(
     return raw
 
 
+def _is_release_path(value: object) -> bool:
+    return isinstance(value, str) and all(
+        re.fullmatch(r"[A-Za-z0-9._-]+", part) and part not in {".", ".."}
+        for part in value.split("/")
+    )
+
+
+def _require_release_queue(
+    raw: object, tagged: Mapping[str, Mapping[str, str]],
+) -> tuple[int, dict[str, dict[str, ReleaseComponent]], dict[str, dict[str, ReleaseDeferral]]]:
+    if not isinstance(raw, dict):
+        raise PolicyError("release queue must be an object")
+    _require_exact_keys(raw, {"max_age_days", "components", "deferrals"}, "release queue")
+    max_age = raw["max_age_days"]
+    if (
+        not isinstance(max_age, int)
+        or isinstance(max_age, bool)
+        or not 0 < max_age <= timedelta.max.days
+    ):
+        raise PolicyError("release queue maximum age must be a positive integer")
+
+    if not isinstance(raw["components"], dict):
+        raise PolicyError("release queue components must be an object")
+    components: dict[str, dict[str, ReleaseComponent]] = {}
+    for repository, workflows in raw["components"].items():
+        if not isinstance(workflows, dict) or not workflows:
+            raise PolicyError("release queue components must name tagged release workflows")
+        components[repository] = {}
+        for workflow, entry in workflows.items():
+            if workflow not in tagged.get(repository, {}) or not isinstance(entry, dict):
+                raise PolicyError("release queue components must name tagged release workflows")
+            _require_exact_keys(entry, {"paths", "version_file"}, "release component")
+            paths, version_file = entry["paths"], entry["version_file"]
+            if (
+                not isinstance(paths, list)
+                or not paths
+                or not all(_is_release_path(path) for path in paths)
+                or len(set(paths)) != len(paths)
+            ):
+                raise PolicyError("release component paths must be unique repository-relative paths")
+            if not _is_release_path(version_file) or not (
+                PurePosixPath(version_file).name in {"pyproject.toml", "VERSION"} or version_file.endswith(".py")
+            ):
+                raise PolicyError("release component version file must be a pyproject.toml, VERSION or .py path")
+            components[repository][workflow] = ReleaseComponent(tuple(paths), version_file)
+
+    if not isinstance(raw["deferrals"], dict):
+        raise PolicyError("release deferrals must be an object")
+    deferrals: dict[str, dict[str, ReleaseDeferral]] = {}
+    for repository, workflows in raw["deferrals"].items():
+        if not isinstance(workflows, dict) or not workflows:
+            raise PolicyError("release deferral must name a queued release workflow")
+        deferrals[repository] = {}
+        for workflow, entry in workflows.items():
+            if workflow not in components.get(repository, {}) or not isinstance(entry, dict):
+                raise PolicyError("release deferral must name a queued release workflow")
+            _require_exact_keys(entry, {"reason", "review_by"}, "release deferral")
+            reason, review_by = entry["reason"], entry["review_by"]
+            if not isinstance(reason, str) or not reason.strip():
+                raise PolicyError("release deferral needs a reason")
+            if not isinstance(review_by, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", review_by) is None:
+                raise PolicyError("release deferral needs a YYYY-MM-DD review date")
+            try:
+                review = date.fromisoformat(review_by)
+            except ValueError:
+                raise PolicyError("release deferral needs a YYYY-MM-DD review date") from None
+            deferrals[repository][workflow] = ReleaseDeferral(reason.strip(), review)
+    return max_age, components, deferrals
+
+
 def load_policy(path: Path) -> Policy:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -383,7 +489,7 @@ def load_policy(path: Path) -> Policy:
         raise PolicyError("policy must be valid UTF-8 JSON") from error
     if not isinstance(raw, dict):
         raise PolicyError("policy must be an object")
-    optional_keys = {"tagged_release_workflows"} & raw.keys()
+    optional_keys = {"tagged_release_workflows", "release_queue"} & raw.keys()
     _require_exact_keys(raw, POLICY_KEYS | optional_keys, "policy")
 
     if (
@@ -417,6 +523,12 @@ def load_policy(path: Path) -> Policy:
     ):
         raise PolicyError("dependabot maximum age must be a positive integer")
 
+    tagged = _require_tagged_release_workflows(
+        raw.get("tagged_release_workflows", {}), repository_set,
+    )
+    release_max_age_days, release_components, release_deferrals = _require_release_queue(
+        raw.get("release_queue", {"max_age_days": 7, "components": {}, "deferrals": {}}), tagged,
+    )
     return Policy(
         schema_version=raw["schema_version"],
         owner=raw["owner"],
@@ -425,9 +537,10 @@ def load_policy(path: Path) -> Policy:
         dependabot_exemptions=dependabot_exemptions,
         dependabot_max_age_days=threshold,
         release_policy_pins=_require_release_policy_pins(raw["release_policy_pins"]),
-        tagged_release_workflows=_require_tagged_release_workflows(
-            raw.get("tagged_release_workflows", {}), repository_set,
-        ),
+        tagged_release_workflows=tagged,
+        release_max_age_days=release_max_age_days,
+        release_components=release_components,
+        release_deferrals=release_deferrals,
     )
 
 
@@ -824,6 +937,7 @@ PROBLEM_SUMMARIES = {
     "RAW_WORKFLOW_REQUEST_FAILED": "workflow source request failed",
     "RAW_WORKFLOW_MISMATCH": "workflow source did not match its Git blob identity",
     "RAW_WORKFLOW_INVALID_UTF8": "workflow source was not valid UTF-8",
+    "RELEASE_PATH_MISSING": "a configured release package path was not in the repository tree",
 }
 
 
@@ -971,8 +1085,22 @@ def _audit_enforcement_only(raw: object, run_id: int) -> bool:
     return True
 
 
+def _collect_tags(repository_path: str, client: GitHubClient) -> tuple[tuple[str, str], ...]:
+    # The tags endpoint supplies the peeled commit for both annotated and
+    # lightweight tags, so each name maps to the commit it releases.
+    tags = []
+    for item in client.paginate(f"{repository_path}/tags", {"per_page": 100}):
+        name = _normalise_default_branch(item.get("name"))
+        commit = item.get("commit")
+        if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str) or FULL_SHA_RE.fullmatch(commit["sha"]) is None:
+            raise ResponseError("release tag commit was invalid")
+        tags.append((name, commit["sha"]))
+    return tuple(tags)
+
+
 def _collect_tagged_release_run(
     repository_path: str, workflow: str, prefix: str, client: GitHubClient,
+    tags: Sequence[tuple[str, str]],
 ) -> WorkflowRun | None:
     raw = client.get_json(
         f"{repository_path}/actions/workflows/{_quote_component(workflow)}/runs",
@@ -981,11 +1109,17 @@ def _collect_tagged_release_run(
     # Validate the complete bounded response before considering any success.
     _normalise_runs(raw)
     candidates: list[tuple[WorkflowRun, str, str]] = []
+    unattributed: list[WorkflowRun] = []
     for item in raw["workflow_runs"]:
         run = _normalise_run(item)
         if run.path != WORKFLOW_PREFIX + workflow:
             raise ResponseError("tagged release run belonged to another workflow")
         if _run_event(item) not in {"push", "release", "workflow_dispatch"}:
+            continue
+        if item.get("head_branch") is None:
+            # GitHub drops the ref of a run whose tag was later deleted, such as a
+            # failed tag pushed again after a fix. Only the newest attempt matters.
+            unattributed.append(run)
             continue
         branch = _normalise_default_branch(item.get("head_branch"))
         if re.fullmatch(re.escape(prefix) + VERSION_SUFFIX_RE, branch) is None:
@@ -1000,21 +1134,17 @@ def _collect_tagged_release_run(
         ):
             raise ResponseError("tagged release source identity was invalid")
         candidates.append((run, branch, sha))
+    latest = max(
+        [*(item[0] for item in candidates), *unattributed], key=_run_order, default=None,
+    )
+    if latest is not None and latest in unattributed:
+        raise ResponseError("the latest release run named no tag")
     if not candidates:
         return None
     run, tag, sha = max(candidates, key=lambda item: _run_order(item[0]))
 
-    # The tags endpoint supplies the peeled commit for both annotated and
-    # lightweight tags. A missing or moved latest tag must not fall back to green.
-    tags = client.paginate(f"{repository_path}/tags", {"per_page": 100})
-    matches = []
-    for item in tags:
-        name = _normalise_default_branch(item.get("name"))
-        commit = item.get("commit")
-        if not isinstance(commit, dict) or not isinstance(commit.get("sha"), str) or FULL_SHA_RE.fullmatch(commit["sha"]) is None:
-            raise ResponseError("release tag commit was invalid")
-        if name == tag:
-            matches.append(commit["sha"])
+    # A missing or moved latest tag must not fall back to green.
+    matches = [commit for name, commit in tags if name == tag]
     if matches != [sha]:
         raise ResponseError("latest release run did not match its current tag commit")
     heads = client.get_json(f"{repository_path}/git/matching-refs/heads/{_quote_component(tag)}")
@@ -1027,6 +1157,87 @@ def _collect_tagged_release_run(
         if ref == f"refs/heads/{tag}":
             raise ResponseError("release run ref was ambiguous between branch and tag")
     return run
+
+
+def _version_order(tag: str, prefix: str) -> tuple[tuple[int, int, int, bool], str]:
+    core, prerelease, _ = tag[len(prefix):].split("+", 1)[0].partition("-")
+    major, minor, patch = (int(part) for part in core.split("."))
+    # ponytail: prereleases of one version order by name, not by semver precedence;
+    # the estate tags none. Parse the identifiers if prerelease tags appear.
+    return (major, minor, patch, not prerelease), tag
+
+
+def _read_version(
+    repository_path: str, default_branch: str, path: str, client: GitHubClient,
+) -> str:
+    """Read the version a component declares on the default branch."""
+    raw = client.get_json(
+        f"{repository_path}/contents/{_quote_workflow_path(path)}", {"ref": default_branch},
+    )
+    if not isinstance(raw, dict) or raw.get("encoding") != "base64" or not isinstance(raw.get("content"), str):
+        raise ResponseError("version file response omitted its content")
+    try:
+        text = base64.b64decode(raw["content"]).decode("utf-8")
+        name = PurePosixPath(path).name
+        if name == "pyproject.toml":
+            version = tomllib.loads(text)["project"]["version"]
+        elif name == "VERSION":
+            version = text.strip()
+        else:
+            match = re.search(r"^__version__\s*=\s*[\"']([^\"']+)[\"']\s*$", text, re.MULTILINE)
+            version = match.group(1) if match else None
+    except (ValueError, KeyError, TypeError):
+        raise ResponseError("version file did not declare a version") from None
+    if not isinstance(version, str) or re.fullmatch(VERSION_SUFFIX_RE, version) is None:
+        raise ResponseError("version file did not declare a version")
+    return version
+
+
+def _collect_release_backlog(
+    repository_path: str, default_branch: str, workflow: str, prefix: str,
+    component: ReleaseComponent, tags: Sequence[tuple[str, str]], client: GitHubClient,
+) -> ReleaseBacklog:
+    """Compare the declared version and package changes with the latest release tag."""
+    version = _read_version(repository_path, default_branch, component.version_file, client)
+    released = [
+        (name, sha) for name, sha in tags
+        if re.fullmatch(re.escape(prefix) + VERSION_SUFFIX_RE, name) is not None
+    ]
+    if not released:
+        return ReleaseBacklog(workflow, component.version_file, version, None)
+    tag, tag_sha = max(released, key=lambda item: _version_order(item[0], prefix))
+    version_tagged = any(name == prefix + version for name, _sha in released)
+    commit = client.get_json(f"{repository_path}/git/commits/{tag_sha}")
+    committer = commit.get("committer") if isinstance(commit, dict) else None
+    if not isinstance(committer, dict):
+        raise ResponseError("release tag commit omitted its committer")
+    tagged_at = _parse_github_time(committer.get("date"))
+
+    # ponytail: committer dates stand in for ancestry, which holds for the estate's
+    # squash-merged histories. A merge commit carrying older-dated commits would
+    # hide them; comparing each candidate with the tag would close that gap.
+    oldest: tuple[datetime, str] | None = None
+    for path in component.paths:
+        for item in client.paginate(
+            f"{repository_path}/commits",
+            {"sha": default_branch, "path": path, "since": _zulu(tagged_at), "per_page": 100},
+        ):
+            sha = item.get("sha")
+            details = item.get("commit")
+            if (
+                not isinstance(sha, str)
+                or FULL_SHA_RE.fullmatch(sha) is None
+                or not isinstance(details, dict)
+                or not isinstance(details.get("committer"), dict)
+            ):
+                raise ResponseError("package commit was invalid")
+            if sha == tag_sha:
+                continue
+            when = _parse_github_time(details["committer"].get("date"))
+            if oldest is None or when < oldest[0]:
+                oldest = (when, sha)
+    backlog = ReleaseBacklog(workflow, component.version_file, version, tag, tag_sha, version_tagged)
+    return backlog if oldest is None else replace(backlog, oldest_sha=oldest[1], oldest_at=oldest[0])
 
 
 def _normalise_dependabot_pull_requests(
@@ -1055,6 +1266,7 @@ def _collect_repository(
     client: GitHubClient,
     problems: list[CollectionProblem],
     tagged_release_workflows: Mapping[str, str],
+    release_components: Mapping[str, ReleaseComponent],
 ) -> RepositorySnapshot:
     owner_component = _quote_component(owner)
     repository_component = _quote_component(name)
@@ -1103,12 +1315,26 @@ def _collect_repository(
         ),
         default_branch=default_branch,
     )
+    tags = _collect_tags(repository_path, client) if tagged_release_workflows else ()
     for workflow, prefix in tagged_release_workflows.items():
         if WORKFLOW_PREFIX + workflow not in workflow_sources:
             raise ResponseError("configured tagged release workflow was not collected")
-        run = _collect_tagged_release_run(repository_path, workflow, prefix, client)
+        run = _collect_tagged_release_run(repository_path, workflow, prefix, client, tags)
         if run is not None:
             workflow_runs += (run,)
+    release_backlogs = []
+    for workflow, component in release_components.items():
+        # A mistyped path would match no commit and hide the backlog it was meant to show.
+        if component.version_file not in paths or not all(
+            path in paths or any(item.startswith(path + "/") for item in paths)
+            for path in component.paths
+        ):
+            problems.append(_problem("RELEASE_PATH_MISSING", name))
+            continue
+        release_backlogs.append(_collect_release_backlog(
+            repository_path, default_branch, workflow, tagged_release_workflows[workflow],
+            component, tags, client,
+        ))
     workflow_runs = tuple(sorted(workflow_runs, key=_run_order, reverse=True))
     if name.casefold() == "portfolio-audit":
         run = next((item for item in workflow_runs if item.path == AUDIT_WORKFLOW_PATH), None)
@@ -1136,6 +1362,7 @@ def _collect_repository(
         workflow_sources,
         workflow_runs,
         dependabot_pull_requests,
+        tuple(release_backlogs),
     )
 
 
@@ -1173,17 +1400,23 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
         problems.append(_problem("ESTATE_LIMIT_EXCEEDED"))
         return _result(client, discovered, problems=problems)
 
-    tagged_workflow_count = sum(
-        len(policy.tagged_release_workflows.get(name, {}))
+    tagged = [policy.tagged_release_workflows.get(name, {}) for name, _default_branch in active_repositories]
+    queued = [
+        component
         for name, _default_branch in active_repositories
-    )
+        for component in policy.release_components.get(name, {}).values()
+    ]
     audit_job_request = int(any(name.casefold() == "portfolio-audit" for name in discovered))
     try:
-        # Each tagged workflow adds a run query, bounded tag pagination and
-        # a branch-disambiguation request. Reserve the conditional audit jobs
-        # query too, retaining the existing rate headroom.
+        # A repository with tagged workflows adds bounded tag pagination; each
+        # tagged workflow adds a run query and a branch-disambiguation request;
+        # each queued component adds its version file, its tag commit and
+        # bounded commit pagination per package path. Reserve the conditional
+        # audit jobs query too, retaining the existing rate headroom.
         client.require_capacity(
-            len(active_repositories) * 3 + tagged_workflow_count * (MAX_PAGES + 2)
+            len(active_repositories) * 3
+            + sum(MAX_PAGES + 2 * len(workflows) for workflows in tagged if workflows)
+            + sum(2 + MAX_PAGES * len(component.paths) for component in queued)
             + audit_job_request
         )
     except RateLimitError:
@@ -1197,6 +1430,7 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
                 _collect_repository(
                     policy.owner, name, default_branch, client, problems,
                     policy.tagged_release_workflows.get(name, {}),
+                    policy.release_components.get(name, {}),
                 )
             )
         except AuthenticationError:
@@ -1384,6 +1618,11 @@ def evaluate(
         for family, pins in policy.release_policy_pins.items()
     }
     stale_threshold = timedelta(days=policy.dependabot_max_age_days)
+    release_max_age = timedelta(days=policy.release_max_age_days)
+    release_deferrals = {
+        repository.casefold(): workflows
+        for repository, workflows in policy.release_deferrals.items()
+    }
 
     for repository in collection.repositories:
         if repository.name.casefold() not in discovered:
@@ -1488,6 +1727,46 @@ def evaluate(
                         "Dependabot pull request exceeded the maximum age",
                         f"{repository_url}/pull/"
                         f"{_quote_component(str(pull_request.number))}",
+                    )
+                )
+
+        repository_deferrals = release_deferrals.get(repository.name.casefold(), {})
+        for backlog in repository.release_backlogs:
+            if backlog.tag is None or backlog.tag_sha is None:
+                findings.append(
+                    Finding(
+                        Severity.NOTICE,
+                        repository.name,
+                        "RELEASE_TAG_MISSING",
+                        f"{backlog.workflow} has no release tag matching its prefix",
+                        _source_url(policy.owner, repository, WORKFLOW_PREFIX + backlog.workflow),
+                    )
+                )
+                continue
+            deferral = repository_deferrals.get(backlog.workflow)
+            if deferral is not None and now.date() <= deferral.review_by:
+                continue
+            if not backlog.version_tagged:
+                findings.append(
+                    Finding(
+                        Severity.ACTION,
+                        repository.name,
+                        "RELEASE_VERSION_UNTAGGED",
+                        f"version {backlog.version} has no release tag; the latest is {backlog.tag}",
+                        f"{repository_url}/blob/{_quote_component(repository.default_branch)}/"
+                        f"{_quote_workflow_path(backlog.version_file)}",
+                    )
+                )
+            if backlog.oldest_at is not None and now - backlog.oldest_at > release_max_age:
+                findings.append(
+                    Finding(
+                        Severity.ACTION,
+                        repository.name,
+                        "RELEASE_CHANGES_UNRELEASED",
+                        f"package changes since {backlog.tag} have waited more than "
+                        f"{policy.release_max_age_days} days for a release",
+                        f"{repository_url}/compare/{backlog.tag_sha}..."
+                        f"{_quote_component(repository.default_branch)}",
                     )
                 )
 

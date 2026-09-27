@@ -28,19 +28,49 @@ code from the immutable triggering commit with checkout credentials disabled.
 The collector keeps default-branch workflow checks separate from release-tag
 evidence. It excludes pull-request and merge-group events from default-branch
 results. The optional `tagged_release_workflows` policy maps repository names
-and workflow filenames to `v` or `component/v` version prefixes. It currently
-covers Australian Accounting's `release-aus-accounting-mcp.yml`, whose tag-push run
-now carries the PyPI publish job. Other workflows retain
-default-branch collection.
+and workflow filenames to `v` or `component/v` version prefixes. It covers all
+18 release callers, whose tag-push runs carry the publish jobs. Other workflows
+retain default-branch collection.
 
-For that workflow, the collector also reads the latest 100 completed
+For those workflows, the collector also reads the latest 100 completed
 workflow runs and considers matching version tags from push, release and manual
 dispatch events. It checks the latest eligible tag against the run's repository
 and commit, including the peeled commit of annotated tags. Missing or moved tags,
 malformed evidence and a branch sharing the tag name produce `INCOMPLETE`.
+GitHub drops the ref of a run whose tag was later deleted, such as a failed tag
+pushed again after a fix; such a run produces `INCOMPLETE` only while it is the
+newest release attempt.
 Creation time orders results, so a rerun of an older release cannot hide a newer
 failure. A newer default-branch failure still takes precedence. Failed eligible
 runs remain action findings; cancelled, skipped and neutral runs remain notices.
+
+## Release queue
+
+The optional `release_queue` policy lists, for each tagged release workflow, the
+package paths its release ships (the wheel's sources and `pyproject.toml`, not
+tests or documentation) and the file that declares its version: a
+`pyproject.toml` with a static version, a `VERSION` file or a `.py` file setting
+`__version__`. For each component the collector reads that version on the
+default branch, finds the component's latest release tag by version order, and
+lists commits touching the package paths after the tagged commit's date. Two
+action findings follow:
+
+- `RELEASE_VERSION_UNTAGGED`: the declared version has no release tag, so a
+  release was prepared and never tagged.
+- `RELEASE_CHANGES_UNRELEASED`: the oldest package change after the latest tag
+  is more than `max_age_days` old (7), so users of the published release are
+  missing it.
+
+A component without any matching tag is a `RELEASE_TAG_MISSING` notice. A
+configured path or version file missing from the tree reports
+`RELEASE_PATH_MISSING` and `INCOMPLETE`, because a mistyped path would match
+nothing and hide the backlog. A `deferrals` entry, with a `reason` and a
+`review_by` date, holds both findings for a component until that date passes.
+Committer dates stand in for ancestry, which holds for squash-merged histories.
+The queue adds about 2 requests per component plus one per package path. It
+compares versions with tags, not with PyPI: the tag run publishes, so a failed
+publication already shows as that run's failure, and the collector stays on
+GitHub's hosts.
 
 The audit's own `portfolio-audit.yml` run needs a separate check because its
 enforcement job fails when the report contains findings. For the latest failed

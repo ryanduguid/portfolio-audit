@@ -24,9 +24,188 @@
   },
   "dependabot_max_age_days": 14,
   "tagged_release_workflows": {
+    "accounting-review-pipeline": {
+      "release-accounting-excel-toolkit.yml": "accounting-excel-toolkit/v",
+      "release-elizabeth-anne-alexander.yml": "elizabeth-anne-alexander/v",
+      "release-evatt.yml": "evatt/v",
+      "release-monthly-close-control-plane.yml": "monthly-close-control-plane/v",
+      "release-review-ready-gate.yml": "review-ready-gate/v",
+      "release-xero-trial-balance-export.yml": "xero-trial-balance-export/v"
+    },
+    "au-fpa-pack": {
+      "release.yml": "v"
+    },
+    "au-tax-legislation-corpus": {
+      "release.yml": "v"
+    },
     "australian-accounting": {
-      "release-aus-accounting-mcp.yml": "aus-accounting-mcp/v"
+      "release-ato-benchmark-compare.yml": "ato-benchmark-compare/v",
+      "release-aus-accounting-mcp.yml": "aus-accounting-mcp/v",
+      "release-australian-tax-calculators.yml": "australian-tax-calculators/v",
+      "release-div7a-loan-review.yml": "div7a-loan-review/v",
+      "release-payday-super-checker.yml": "payday-super-checker/v",
+      "release-solomons-sword.yml": "solomons-sword/v",
+      "release-the-exchequer-tally.yml": "the-exchequer-tally/v",
+      "release-the-wip-tally.yml": "the-wip-tally/v"
+    },
+    "australian-accounting-skills": {
+      "release.yml": "v"
+    },
+    "planning-analytics-model": {
+      "release.yml": "v"
     }
+  },
+  "release_queue": {
+    "max_age_days": 7,
+    "components": {
+      "accounting-review-pipeline": {
+        "release-accounting-excel-toolkit.yml": {
+          "paths": [
+            "adapters/accounting-excel-toolkit"
+          ],
+          "version_file": "adapters/accounting-excel-toolkit/VERSION"
+        },
+        "release-elizabeth-anne-alexander.yml": {
+          "paths": [
+            "packages/elizabeth-anne-alexander/elizabeth_anne_alexander",
+            "packages/elizabeth-anne-alexander/pyproject.toml"
+          ],
+          "version_file": "packages/elizabeth-anne-alexander/elizabeth_anne_alexander/version.py"
+        },
+        "release-evatt.yml": {
+          "paths": [
+            "packages/evatt/evatt",
+            "packages/evatt/pyproject.toml"
+          ],
+          "version_file": "packages/evatt/evatt/version.py"
+        },
+        "release-monthly-close-control-plane.yml": {
+          "paths": [
+            "packages/monthly-close-control-plane/closecontrol",
+            "packages/monthly-close-control-plane/pyproject.toml"
+          ],
+          "version_file": "packages/monthly-close-control-plane/pyproject.toml"
+        },
+        "release-review-ready-gate.yml": {
+          "paths": [
+            "packages/review-ready-gate/reviewready",
+            "packages/review-ready-gate/pyproject.toml"
+          ],
+          "version_file": "packages/review-ready-gate/pyproject.toml"
+        },
+        "release-xero-trial-balance-export.yml": {
+          "paths": [
+            "packages/xero-trial-balance-export/auth.py",
+            "packages/xero-trial-balance-export/export_tb.py",
+            "packages/xero-trial-balance-export/pyproject.toml",
+            "packages/xero-trial-balance-export/token_store.py",
+            "packages/xero-trial-balance-export/xero_client.py"
+          ],
+          "version_file": "packages/xero-trial-balance-export/pyproject.toml"
+        }
+      },
+      "au-fpa-pack": {
+        "release.yml": {
+          "paths": [
+            "pyfpa",
+            "pyproject.toml"
+          ],
+          "version_file": "pyproject.toml"
+        }
+      },
+      "au-tax-legislation-corpus": {
+        "release.yml": {
+          "paths": [
+            "VERSION",
+            "fadden",
+            "pyproject.toml",
+            "tax_radar_au"
+          ],
+          "version_file": "VERSION"
+        }
+      },
+      "australian-accounting": {
+        "release-ato-benchmark-compare.yml": {
+          "paths": [
+            "packages/ato-benchmark-compare/atobenchmark",
+            "packages/ato-benchmark-compare/pyproject.toml"
+          ],
+          "version_file": "packages/ato-benchmark-compare/pyproject.toml"
+        },
+        "release-aus-accounting-mcp.yml": {
+          "paths": [
+            "apps/aus-accounting-mcp/aus_accounting_mcp",
+            "apps/aus-accounting-mcp/pyproject.toml"
+          ],
+          "version_file": "apps/aus-accounting-mcp/pyproject.toml"
+        },
+        "release-australian-tax-calculators.yml": {
+          "paths": [
+            "packages/australian-tax-calculators/austaxcalc",
+            "packages/australian-tax-calculators/pyproject.toml"
+          ],
+          "version_file": "packages/australian-tax-calculators/pyproject.toml"
+        },
+        "release-div7a-loan-review.yml": {
+          "paths": [
+            "packages/div7a-loan-review/div7aloan",
+            "packages/div7a-loan-review/pyproject.toml"
+          ],
+          "version_file": "packages/div7a-loan-review/pyproject.toml"
+        },
+        "release-payday-super-checker.yml": {
+          "paths": [
+            "packages/payday-super-checker/paydaysuper",
+            "packages/payday-super-checker/pyproject.toml"
+          ],
+          "version_file": "packages/payday-super-checker/pyproject.toml"
+        },
+        "release-solomons-sword.yml": {
+          "paths": [
+            "packages/solomons-sword/louisgoldberg",
+            "packages/solomons-sword/pyproject.toml"
+          ],
+          "version_file": "packages/solomons-sword/pyproject.toml"
+        },
+        "release-the-exchequer-tally.yml": {
+          "paths": [
+            "packages/the-exchequer-tally/edwinnixon",
+            "packages/the-exchequer-tally/pyproject.toml"
+          ],
+          "version_file": "packages/the-exchequer-tally/pyproject.toml"
+        },
+        "release-the-wip-tally.yml": {
+          "paths": [
+            "packages/the-wip-tally/wiptally",
+            "packages/the-wip-tally/pyproject.toml"
+          ],
+          "version_file": "packages/the-wip-tally/pyproject.toml"
+        }
+      },
+      "australian-accounting-skills": {
+        "release.yml": {
+          "paths": [
+            ".agents",
+            ".claude",
+            ".claude-plugin",
+            ".codex-plugin",
+            "VERSION"
+          ],
+          "version_file": "VERSION"
+        }
+      },
+      "planning-analytics-model": {
+        "release.yml": {
+          "paths": [
+            "model",
+            "pacioliscube",
+            "pyproject.toml"
+          ],
+          "version_file": "pyproject.toml"
+        }
+      }
+    },
+    "deferrals": {}
   },
   "release_policy_pins": {
     "attribution-policy.yml": [
