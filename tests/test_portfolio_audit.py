@@ -310,7 +310,7 @@ class PolicyTests(unittest.TestCase):
             component(extra=1),
             *(component(paths=value) for value in (
                 [], "pkg", ["pkg", "pkg"], [""], ["/pkg"], ["pkg/"], ["a//b"], ["a/../b"],
-                ["./pkg"], ["pkg/*"], ["a\\b"], [7],
+                ["./pkg"], ["pkg/*"], ["a\\b"], [7], ["pkg", ["nested"]], [{"path": "pkg"}],
             )),
             *(component(version_file=value) for value in (
                 None, "", "setup.cfg", "pkg/version.txt", "/VERSION", "../VERSION", "pkg/*.py",

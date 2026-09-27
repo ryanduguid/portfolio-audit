@@ -448,8 +448,8 @@ def _require_release_queue(
             if (
                 not isinstance(paths, list)
                 or not paths
-                or len(set(paths)) != len(paths)
                 or not all(_is_release_path(path) for path in paths)
+                or len(set(paths)) != len(paths)
             ):
                 raise PolicyError("release component paths must be unique repository-relative paths")
             if not _is_release_path(version_file) or not (
