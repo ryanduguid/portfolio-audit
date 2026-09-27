@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import hashlib
 import io
@@ -8,7 +9,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from dataclasses import asdict, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from http.client import HTTPMessage
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,8 @@ from scripts.portfolio_audit import (
     Policy,
     PolicyError,
     RateLimitError,
+    ReleaseComponent,
+    ReleaseDeferral,
     RepositorySnapshot,
     ResponseError,
     SafetyLimitError,
@@ -260,6 +263,80 @@ class PolicyTests(unittest.TestCase):
                 raw["tagged_release_workflows"] = value
                 with self.assertRaisesRegex(PolicyError, "tagged release"):
                     load_policy(self.write_policy(raw))
+
+    def test_accepts_a_release_queue_and_defaults_without_one(self) -> None:
+        raw = valid_policy_dict()
+        policy = load_policy(self.write_policy(raw))
+        self.assertEqual((policy.release_max_age_days, policy.release_components, policy.release_deferrals), (7, {}, {}))
+        raw["tagged_release_workflows"] = {"example": {"release.yml": "v"}}
+        raw["release_queue"] = {
+            "max_age_days": 10,
+            "components": {"example": {"release.yml": {
+                "paths": ["pkg", ".claude-plugin/plugin.json"], "version_file": "pkg/version.py",
+            }}},
+            "deferrals": {"example": {"release.yml": {"reason": " preparing v1 ", "review_by": "2026-10-31"}}},
+        }
+        policy = load_policy(self.write_policy(raw))
+        self.assertEqual(policy.release_max_age_days, 10)
+        self.assertEqual(
+            policy.release_components,
+            {"example": {"release.yml": ReleaseComponent(("pkg", ".claude-plugin/plugin.json"), "pkg/version.py")}},
+        )
+        self.assertEqual(
+            policy.release_deferrals,
+            {"example": {"release.yml": ReleaseDeferral("preparing v1", date(2026, 10, 31))}},
+        )
+
+    def test_rejects_malformed_release_queue(self) -> None:
+        def queue(**changes: object) -> dict[str, object]:
+            return {
+                "max_age_days": 7,
+                "components": {"example": {"release.yml": {"paths": ["pkg"], "version_file": "VERSION"}}},
+                "deferrals": {},
+                **changes,
+            }
+
+        def component(**changes: object) -> dict[str, object]:
+            return queue(components={"example": {"release.yml": {"paths": ["pkg"], "version_file": "VERSION", **changes}}})
+
+        invalid: tuple[object, ...] = (
+            None, [], {"max_age_days": 7, "components": {}}, queue(extra=1),
+            queue(max_age_days=0), queue(max_age_days=True), queue(max_age_days="7"),
+            queue(components=[]), queue(components={"example": {}}), queue(components={"example": []}),
+            queue(components={"example": {"release.yml": ["pkg"]}}),
+            queue(components={"example": {"publish.yml": {"paths": ["pkg"], "version_file": "VERSION"}}}),
+            queue(components={".github": {"release.yml": {"paths": ["pkg"], "version_file": "VERSION"}}}),
+            queue(components={"example": {"release.yml": {"paths": ["pkg"]}}}),
+            component(extra=1),
+            *(component(paths=value) for value in (
+                [], "pkg", ["pkg", "pkg"], [""], ["/pkg"], ["pkg/"], ["a//b"], ["a/../b"],
+                ["./pkg"], ["pkg/*"], ["a\\b"], [7],
+            )),
+            *(component(version_file=value) for value in (
+                None, "", "setup.cfg", "pkg/version.txt", "/VERSION", "../VERSION", "pkg/*.py",
+            )),
+            queue(deferrals=[]), queue(deferrals={"example": {}}),
+            queue(deferrals={"example": {"publish.yml": {"reason": "r", "review_by": "2026-10-31"}}}),
+            *(queue(deferrals={"example": {"release.yml": value}}) for value in (
+                "defer", {"reason": "r"}, {"reason": "r", "review_by": "2026-10-31", "extra": 1},
+                {"reason": " ", "review_by": "2026-10-31"}, {"reason": "r", "review_by": "31/10/2026"},
+                {"reason": "r", "review_by": "2026-02-30"}, {"reason": "r", "review_by": 20261031},
+            )),
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                raw = valid_policy_dict()
+                raw["tagged_release_workflows"] = {"example": {"release.yml": "v"}}
+                raw["release_queue"] = value
+                with self.assertRaisesRegex(PolicyError, "release"):
+                    load_policy(self.write_policy(raw))
+
+    def test_live_policy_queues_every_release_caller(self) -> None:
+        policy = load_policy(Path("portfolio-audit-policy.json"))
+        tagged = {(repository, workflow) for repository, workflows in policy.tagged_release_workflows.items() for workflow in workflows}
+        queued = {(repository, workflow) for repository, workflows in policy.release_components.items() for workflow in workflows}
+        self.assertEqual(len(tagged), 18)
+        self.assertEqual(queued, tagged)
 
     def test_cutover_inventory_and_approved_pin_do_not_raise_false_actions(self) -> None:
         policy = load_policy(Path("portfolio-audit-policy.json"))
@@ -989,12 +1066,20 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(len(transport.requests), 1)
 
     def test_tagged_workflows_reserve_bounded_request_capacity_before_collection(self) -> None:
-        for workflows, remaining in (
-            ({"release.yml": "v"}, 114),
-            ({"release.yml": "v", "publish.yml": "example/v"}, 126),
-        ):
-            with self.subTest(workflows=workflows):
-                policy = replace(small_policy(), tagged_release_workflows={"example": workflows})
+        # One tag listing per repository, then a run query and a branch check per
+        # workflow, then a version file, a tag commit and bounded commit pages
+        # per path of each queued component.
+        cases: tuple[tuple[dict[str, str], dict[str, ReleaseComponent], int], ...] = (
+            ({"release.yml": "v"}, {}, 114),
+            ({"release.yml": "v", "publish.yml": "example/v"}, {}, 116),
+            ({"release.yml": "v"}, {"release.yml": ReleaseComponent(("pkg",), "VERSION")}, 126),
+        )
+        for workflows, queued, remaining in cases:
+            with self.subTest(workflows=workflows, queued=queued):
+                policy = replace(
+                    small_policy(), tagged_release_workflows={"example": workflows},
+                    release_components={"example": queued} if queued else {},
+                )
                 transport = FakeTransport([api_response([public_repo()], remaining=remaining)])
                 result = collect_estate(policy, GitHubClient("token", transport=transport))
                 self.assertEqual(result.repositories, ())
@@ -1373,6 +1458,15 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
                 report, _ = self.audit([{**workflow_run(20), **change}])
                 self.assertEqual(report.status, AuditStatus.INCOMPLETE)
 
+    def test_a_run_whose_tag_was_deleted_matters_only_while_it_is_the_latest_attempt(self) -> None:
+        deleted = {**workflow_run(15, conclusion="failure", created="2026-09-02T13:39:00Z"), "head_branch": None}
+        report, _ = self.audit([deleted, workflow_run(20)])
+        self.assertEqual(report.collection_errors, ())
+        self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
+        newer = {**deleted, "id": 25, "created_at": "2026-09-02T13:41:00Z"}
+        report, _ = self.audit([newer, workflow_run(20)])
+        self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+
     def test_latest_cancelled_release_remains_a_notice(self) -> None:
         report, _ = self.audit([workflow_run(20, conclusion="cancelled")])
         self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
@@ -1414,6 +1508,211 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
         policy = replace(small_policy(), expected_repositories=("example",), tagged_release_workflows={"example": {"release.yml": "v"}})
         result = collect_estate(policy, GitHubClient("token", transport=collection_transport()))
         self.assertTrue(result.problems)
+
+
+def package_commit(sha: str, when: str) -> dict[str, object]:
+    return {"sha": sha, "commit": {"committer": {"date": when}, "message": "SENSITIVE-COMMIT-SENTINEL"}}
+
+
+class ReleaseQueueCollectorTests(unittest.TestCase):
+    """The queue flags an untagged version and package changes that have waited too long for a release."""
+
+    TAG_SHA = "b" * 40
+    FILES = {
+        "pyproject.toml": '[project]\nname = "example"\nversion = "0.1.10"\n',
+        "VERSION": "0.1.10\n",
+        "pkg/version.py": '"""Version."""\n\n__version__ = "0.1.10"\n',
+    }
+
+    def audit(
+        self, commits: dict[str, list[dict[str, object]]], *,
+        tags: list[dict[str, object]] | None = None,
+        release_runs: list[dict[str, object]] | None = None,
+        paths: tuple[str, ...] = ("pkg", "pyproject.toml"),
+        version_file: str = "pyproject.toml",
+        files: dict[str, str] | None = None,
+        deferrals: dict[str, dict[str, ReleaseDeferral]] | None = None,
+        tag_commit: object = None,
+        now: datetime = datetime(2026, 9, 20, tzinfo=UTC),
+    ) -> tuple[AuditReport, FakeTransport]:
+        if tags is None:
+            tags = [
+                {"name": "v0.1.9", "commit": {"sha": "a" * 40}},
+                {"name": "v0.1.10", "commit": {"sha": self.TAG_SHA}},
+                {"name": "other/v9.9.9", "commit": {"sha": "c" * 40}},
+            ]
+        if release_runs is None:
+            release_runs = [{**workflow_run(20, branch="v0.1.10"), "head_sha": self.TAG_SHA}]
+        if tag_commit is None:
+            tag_commit = {"sha": self.TAG_SHA, "committer": {"date": "2026-09-10T00:00:00Z"}}
+        contents = {**self.FILES, **(files or {})}
+        source = b"name: Release\non:\n  push:\n    tags: ['v*']\njobs: {}\n"
+        tree = [
+            {"path": path, "type": "blob", "sha": blob_sha(source)}
+            for path in (".github/workflows/release.yml", ".github/dependabot.yml")
+        ] + [
+            {"path": path, "type": "blob", "sha": "f" * 40}
+            for path in ("pkg/module.py", "docs/guide.md", *self.FILES)
+        ]
+
+        class RoutingTransport(FakeTransport):
+            def __init__(self) -> None:
+                super().__init__([])
+
+            def request(self, url: str, headers: dict[str, str]) -> HttpResponse:
+                self.requests.append((url, headers))
+                parsed = urlsplit(url)
+                query = parse_qs(parsed.query)
+                base = "/repos/ryanduguid/example"
+                if parsed.path == "/users/ryanduguid/repos":
+                    return api_response([public_repo()])
+                if parsed.path == base + "/git/trees/main":
+                    return api_response({"truncated": False, "tree": tree})
+                if parsed.hostname == "raw.githubusercontent.com":
+                    return HttpResponse(200, {}, source)
+                if parsed.path == base + "/actions/runs":
+                    return api_response({"workflow_runs": []})
+                if parsed.path == base + "/actions/workflows/release.yml/runs":
+                    return api_response({"workflow_runs": release_runs})
+                if parsed.path == base + "/tags":
+                    return api_response(tags)
+                if parsed.path.startswith(base + "/git/matching-refs/heads/"):
+                    return api_response([])
+                if parsed.path == base + "/git/commits/" + ReleaseQueueCollectorTests.TAG_SHA:
+                    return api_response(tag_commit)
+                if parsed.path.startswith(base + "/contents/"):
+                    if query != {"ref": ["main"]}:
+                        raise AssertionError("version file query changed")
+                    text = contents[parsed.path.removeprefix(base + "/contents/")]
+                    return api_response({"encoding": "base64", "content": base64.b64encode(text.encode()).decode()})
+                if parsed.path == base + "/commits":
+                    expected = {"sha": ["main"], "since": ["2026-09-10T00:00:00Z"], "per_page": ["100"]}
+                    if {key: value for key, value in query.items() if key != "path"} != expected:
+                        raise AssertionError("package commit query changed")
+                    return api_response(commits.get(query["path"][0], []))
+                if parsed.path == base + "/pulls":
+                    return api_response([])
+                raise AssertionError(f"unexpected request: {url}")
+
+        transport = RoutingTransport()
+        policy = replace(
+            small_policy(), expected_repositories=("example",),
+            tagged_release_workflows={"example": {"release.yml": "v"}},
+            release_components={"example": {"release.yml": ReleaseComponent(paths, version_file)}},
+            release_deferrals=deferrals or {},
+        )
+        result = collect_estate(policy, GitHubClient("TOKEN-SENTINEL", transport=transport))
+        return build_report(policy, result, evaluate(policy, result, now), now, now), transport
+
+    @staticmethod
+    def queue_findings(report: AuditReport) -> list[tuple[Severity, str, str, str]]:
+        return [
+            (item.severity, item.code, item.summary, item.url) for item in report.findings
+            if item.code.startswith("RELEASE_")
+        ]
+
+    def test_package_changes_waiting_past_the_limit_are_flagged_from_the_latest_version(self) -> None:
+        report, transport = self.audit({"pkg": [
+            package_commit("d" * 40, "2026-09-15T00:00:00Z"),
+            package_commit("e" * 40, "2026-09-11T00:00:00Z"),
+            package_commit(self.TAG_SHA, "2026-09-10T00:00:00Z"),
+        ]})
+        self.assertEqual(report.status, AuditStatus.ACTION_REQUIRED)
+        self.assertEqual(self.queue_findings(report), [(
+            Severity.ACTION, "RELEASE_CHANGES_UNRELEASED",
+            "package changes since v0.1.10 have waited more than 7 days for a release",
+            f"https://github.com/ryanduguid/example/compare/{self.TAG_SHA}...main",
+        )])
+        queried = sorted(parse_qs(urlsplit(url).query)["path"][0] for url, _ in transport.requests if "/commits?" in url)
+        self.assertEqual(queried, ["pkg", "pyproject.toml"])
+        self.assertNotIn("SENSITIVE-COMMIT-SENTINEL", render_json(report) + render_text(report))
+
+    def test_a_version_on_main_without_its_tag_is_flagged_at_once(self) -> None:
+        # The roadmap's fixture: 0.1.8 on main with tags up to 0.1.7, bumped a day ago.
+        tags: list[dict[str, object]] = [{"name": "v0.1.7", "commit": {"sha": self.TAG_SHA}}]
+        runs = [{**workflow_run(20, branch="v0.1.7"), "head_sha": self.TAG_SHA}]
+        for version_file, text in (
+            ("pyproject.toml", '[project]\nname = "example"\nversion = "0.1.8"\n'),
+            ("VERSION", "0.1.8\n"),
+            ("pkg/version.py", '__version__ = "0.1.8"\n'),
+        ):
+            with self.subTest(version_file=version_file):
+                report, _ = self.audit(
+                    {"pyproject.toml": [package_commit("d" * 40, "2026-09-19T00:00:00Z")]},
+                    tags=tags, release_runs=runs, version_file=version_file, files={version_file: text},
+                )
+                self.assertEqual(self.queue_findings(report), [(
+                    Severity.ACTION, "RELEASE_VERSION_UNTAGGED",
+                    "version 0.1.8 has no release tag; the latest is v0.1.7",
+                    f"https://github.com/ryanduguid/example/blob/main/{version_file}",
+                )])
+
+    def test_documentation_only_recent_or_released_changes_are_not_flagged(self) -> None:
+        # The package-path queries return nothing for a documentation-only change.
+        for commits in (
+            {},
+            {"pkg": [package_commit(self.TAG_SHA, "2026-09-10T00:00:00Z")]},
+            {"pkg": [package_commit("d" * 40, "2026-09-13T00:00:01Z")]},
+        ):
+            with self.subTest(commits=commits):
+                report, _ = self.audit(commits)
+                self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
+                self.assertEqual(self.queue_findings(report), [])
+
+    def test_a_change_one_second_past_the_limit_is_flagged(self) -> None:
+        report, _ = self.audit({"pkg": [package_commit("d" * 40, "2026-09-12T23:59:59Z")]})
+        self.assertEqual([item[1] for item in self.queue_findings(report)], ["RELEASE_CHANGES_UNRELEASED"])
+
+    def test_a_deferral_holds_until_its_review_date(self) -> None:
+        waiting = {"pkg": [package_commit("d" * 40, "2026-09-11T00:00:00Z")]}
+        bumped = {"VERSION": "0.2.0\n"}
+        for review_by, codes in (
+            (date(2026, 9, 20), []),
+            (date(2026, 9, 19), ["RELEASE_CHANGES_UNRELEASED", "RELEASE_VERSION_UNTAGGED"]),
+        ):
+            with self.subTest(review_by=review_by):
+                deferral = ReleaseDeferral("waiting on the v1 schema", review_by)
+                report, _ = self.audit(
+                    waiting, version_file="VERSION", files=bumped,
+                    deferrals={"example": {"release.yml": deferral}},
+                )
+                self.assertEqual(sorted(item[1] for item in self.queue_findings(report)), codes)
+
+    def test_a_component_without_a_release_tag_is_a_notice(self) -> None:
+        report, transport = self.audit(
+            {}, tags=[{"name": "other/v9.9.9", "commit": {"sha": "c" * 40}}], release_runs=[],
+        )
+        self.assertEqual(report.collection_errors, ())
+        self.assertEqual(self.queue_findings(report), [(
+            Severity.NOTICE, "RELEASE_TAG_MISSING", "release.yml has no release tag matching its prefix",
+            "https://github.com/ryanduguid/example/blob/main/.github/workflows/release.yml",
+        )])
+        self.assertFalse(any("/commits" in url for url, _ in transport.requests))
+
+    def test_a_missing_path_or_malformed_version_or_commit_makes_the_report_incomplete(self) -> None:
+        missing: tuple[dict[str, Any], ...] = ({"paths": ("pkg", "src")}, {"version_file": "pkg/missing.py"})
+        for options in missing:
+            with self.subTest(options=options):
+                report, transport = self.audit({}, **options)
+                self.assertEqual([problem.code for problem in report.collection_errors], ["RELEASE_PATH_MISSING"])
+                self.assertFalse(any("/contents/" in url for url, _ in transport.requests))
+        cases: tuple[dict[str, Any], ...] = (
+            {"files": {"pyproject.toml": '[project]\nname = "example"\ndynamic = ["version"]\n'}},
+            {"files": {"pyproject.toml": "[project\n"}},
+            {"version_file": "VERSION", "files": {"VERSION": "latest\n"}},
+            {"version_file": "pkg/version.py", "files": {"pkg/version.py": "VERSION = '0.1.10'\n"}},
+            {"commits": {"pkg": [package_commit("not-a-sha", "2026-09-15T00:00:00Z")]}},
+            {"commits": {"pkg": [{"sha": "d" * 40, "commit": {}}]}},
+            {"commits": {"pkg": [package_commit("d" * 40, "not-a-time")]}},
+            {"tag_commit": {"sha": self.TAG_SHA}},
+            {"tag_commit": {"committer": "2026-09-10T00:00:00Z"}},
+            {"tag_commit": []},
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                report, _ = self.audit(options.pop("commits", {}), **options)
+                self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+                self.assertTrue(report.collection_errors)
 
 
 class BlobIntegrityTests(unittest.TestCase):
