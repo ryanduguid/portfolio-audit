@@ -1635,8 +1635,11 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
             ("pyproject.toml", '[project]\nname = "example"\nversion = "0.1.8"\n'),
             ("VERSION", "0.1.8\n"),
             ("pkg/version.py", '__version__ = "0.1.8"\n'),
+            ("pkg/version.py", '__version__ = "0.1.8"  # Package release version\n'),
+            ("pkg/version.py", '__version__: str = "0.1.8"\n'),
+            ("pkg/version.py", '"""Example:\n__version__ = "0.1.7"\n"""\n__version__ = "0.1.8"\n'),
         ):
-            with self.subTest(version_file=version_file):
+            with self.subTest(version_file=version_file, source=text):
                 report, _ = self.audit(
                     {"pyproject.toml": [package_commit("d" * 40, "2026-09-19T00:00:00Z")]},
                     tags=tags, release_runs=runs, version_file=version_file, files={version_file: text},
@@ -1658,6 +1661,32 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
                 report, _ = self.audit(commits)
                 self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
                 self.assertEqual(self.queue_findings(report), [])
+
+    def test_unsupported_python_version_evidence_makes_the_report_incomplete(self) -> None:
+        literal = '__version__ = "0.1.10"\n'
+        for source in (
+            '"""Example:\n' + literal + '"""\n',
+            '__version__ = calculate_version()\n',
+            '__version__: str\n',
+            '__version__ = other = "0.1.10"\n',
+            literal + 'invalid Python syntax\n',
+            literal + '__version__ = "0.2.0"\n',
+            literal + '__version__ = calculate_version()\n',
+            literal + 'if condition:\n    __version__ = "0.2.0"\n',
+            literal + '__version__ += ".1"\n',
+            literal + 'del __version__\n',
+            literal + 'def __version__():\n    return "0.2.0"\n',
+            literal + 'from package import current as __version__\n',
+            literal + 'try:\n    pass\nexcept Exception as __version__:\n    pass\n',
+            literal + 'match value:\n    case {**__version__}:\n        pass\n',
+        ):
+            with self.subTest(source=source):
+                report, _ = self.audit(
+                    {}, version_file="pkg/version.py", files={"pkg/version.py": source},
+                )
+                self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+                self.assertEqual([item.code for item in report.collection_errors],
+                                 ["GITHUB_RESPONSE_INVALID"])
 
     def test_a_change_one_second_past_the_limit_is_flagged(self) -> None:
         report, _ = self.audit({"pkg": [package_commit("d" * 40, "2026-09-12T23:59:59Z")]})

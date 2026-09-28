@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import hashlib
 import json
@@ -1157,6 +1158,43 @@ def _version_order(tag: str, prefix: str) -> tuple[tuple[int, int, int, bool], s
     return (major, minor, patch, not prerelease), tag
 
 
+def _read_python_version(text: str) -> str | None:
+    module = ast.parse(text)
+    declarations: list[tuple[ast.Name, ast.expr | None]] = []
+    for statement in module.body:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+        elif isinstance(statement, ast.AnnAssign) and statement.simple:
+            target = statement.target
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == "__version__":
+            declarations.append((target, statement.value))
+    if len(declarations) != 1:
+        return None
+    target, value = declarations[0]
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+        return None
+    # Reject other explicit bindings conservatively, without resolving scopes
+    # or executing source to decide which declaration would take effect.
+    for node in ast.walk(module):
+        if node is target:
+            continue
+        binding = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            binding = node.id
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                               ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            binding = node.name
+        elif isinstance(node, ast.MatchMapping):
+            binding = node.rest
+        elif isinstance(node, ast.alias):
+            binding = node.asname or node.name.split(".")[0]
+        if binding == "__version__":
+            return None
+    return value.value
+
+
 def _read_version(
     repository_path: str, default_branch: str, path: str, client: GitHubClient,
 ) -> str:
@@ -1174,9 +1212,8 @@ def _read_version(
         elif name == "VERSION":
             version = text.strip()
         else:
-            match = re.search(r"^__version__\s*=\s*[\"']([^\"']+)[\"']\s*$", text, re.MULTILINE)
-            version = match.group(1) if match else None
-    except (ValueError, KeyError, TypeError):
+            version = _read_python_version(text)
+    except (ValueError, KeyError, TypeError, SyntaxError):
         raise ResponseError("version file did not declare a version") from None
     if not isinstance(version, str) or re.fullmatch(VERSION_SUFFIX_RE, version) is None:
         raise ResponseError("version file did not declare a version")

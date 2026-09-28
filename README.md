@@ -50,7 +50,11 @@ The optional `release_queue` policy lists, for each tagged release workflow, the
 package paths its release ships (the wheel's sources and `pyproject.toml`, not
 tests or documentation) and the file that declares its version: a
 `pyproject.toml` with a static version, a `VERSION` file or a `.py` file setting
-`__version__`. For each component the collector reads that version on the
+`__version__`. Python files must have one direct module-level assignment of a
+string literal, optionally annotated. Comments and docstring examples are ignored;
+conflicting explicit bindings, computed declarations and malformed Python produce
+`INCOMPLETE`. This reads static metadata without executing the file or determining
+its eventual runtime value. For each component the collector reads that version on the
 default branch, finds the component's latest release tag by version order, and
 lists commits touching the package paths after the tagged commit's date. Two
 action findings follow:
