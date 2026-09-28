@@ -1159,7 +1159,9 @@ def _version_order(tag: str, prefix: str) -> tuple[tuple[int, int, int, bool], s
 
 
 def _read_python_version(text: str) -> str | None:
-    module = ast.parse(text)
+    module = ast.parse(text.removeprefix("\ufeff"))
+    # AST parsing alone permits invalid scope, such as a module-level return.
+    compile(module, "<version file>", "exec")
     declarations: list[tuple[ast.Name, ast.expr | None]] = []
     for statement in module.body:
         if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
