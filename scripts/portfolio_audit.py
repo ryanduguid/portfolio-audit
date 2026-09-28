@@ -1161,12 +1161,12 @@ def _version_order(tag: str, prefix: str) -> tuple[tuple[int, int, int, bool], s
 def _read_python_version(text: str) -> str | None:
     module = ast.parse(text.removeprefix("\ufeff"))
     # AST parsing alone permits invalid scope, such as a module-level return.
-    compile(module, "<version file>", "exec")
+    compile(module, "<version file>", "exec", dont_inherit=True)
     declarations: list[tuple[ast.Name, ast.expr | None]] = []
     for statement in module.body:
         if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
             target = statement.targets[0]
-        elif isinstance(statement, ast.AnnAssign) and statement.simple:
+        elif isinstance(statement, ast.AnnAssign):
             target = statement.target
         else:
             continue
@@ -1182,12 +1182,13 @@ def _read_python_version(text: str) -> str | None:
     for node in ast.walk(module):
         if node is target:
             continue
-        binding = None
+        # Definitions, exception targets, pattern captures and type parameters
+        # carry their bound name in this field. Import aliases need separate handling.
+        binding = getattr(node, "name", None)
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             binding = node.id
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                               ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
-            binding = node.name
+        elif isinstance(node, ast.arg):
+            binding = node.arg
         elif isinstance(node, ast.MatchMapping):
             binding = node.rest
         elif isinstance(node, ast.alias):

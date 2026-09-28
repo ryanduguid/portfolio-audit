@@ -1638,6 +1638,7 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
             ("pkg/version.py", '\ufeff# Package release version\n__version__ = "0.1.8"\n'),
             ("pkg/version.py", '__version__ = "0.1.8"  # Package release version\n'),
             ("pkg/version.py", '__version__: str = "0.1.8"\n'),
+            ("pkg/version.py", '(__version__): str = "0.1.8"\n'),
             ("pkg/version.py", '"""Example:\n__version__ = "0.1.7"\n"""\n__version__ = "0.1.8"\n'),
         ):
             with self.subTest(version_file=version_file, source=text):
@@ -1678,6 +1679,11 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
             literal + '__version__ += ".1"\n',
             literal + 'del __version__\n',
             literal + 'def __version__():\n    return "0.2.0"\n',
+            literal + 'def function(__version__):\n    pass\n',
+            literal + 'function = lambda __version__: None\n',
+            literal + 'def function[__version__]():\n    pass\n',
+            literal + 'def function[*__version__]():\n    pass\n',
+            literal + 'def function[**__version__]():\n    pass\n',
             literal + 'from package import current as __version__\n',
             literal + 'try:\n    pass\nexcept Exception as __version__:\n    pass\n',
             literal + 'match value:\n    case {**__version__}:\n        pass\n',

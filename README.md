@@ -54,7 +54,8 @@ tests or documentation) and the file that declares its version: a
 string literal, optionally annotated. Comments and docstring examples are ignored;
 conflicting explicit bindings, computed declarations and malformed Python produce
 `INCOMPLETE`. This reads static metadata without executing the file or determining
-its eventual runtime value. For each component the collector reads that version on the
+its eventual runtime value. Accepted syntax depends on the Python version running
+the audit. For each component the collector reads that version on the
 default branch, finds the component's latest release tag by version order, and
 lists commits touching the package paths after the tagged commit's date. Two
 action findings follow:
