@@ -1501,11 +1501,17 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
         problems.append(_problem("ESTATE_LIMIT_EXCEEDED"))
         return _result(client, discovered, problems=problems)
 
-    tagged = [policy.tagged_release_workflows.get(name, {}) for name, _default_branch in active_repositories]
+    tagged_by_repository = {
+        name.casefold(): workflows for name, workflows in policy.tagged_release_workflows.items()
+    }
+    components_by_repository = {
+        name.casefold(): components for name, components in policy.release_components.items()
+    }
+    tagged = [tagged_by_repository.get(name.casefold(), {}) for name, _default_branch in active_repositories]
     queued = [
         component
         for name, _default_branch in active_repositories
-        for component in policy.release_components.get(name, {}).values()
+        for component in components_by_repository.get(name.casefold(), {}).values()
     ]
     audit_job_request = int(any(name.casefold() == "portfolio-audit" for name in discovered))
     try:
@@ -1530,8 +1536,8 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
             repositories.append(
                 _collect_repository(
                     policy.owner, name, default_branch, client, problems,
-                    policy.tagged_release_workflows.get(name, {}),
-                    policy.release_components.get(name, {}),
+                    tagged_by_repository.get(name.casefold(), {}),
+                    components_by_repository.get(name.casefold(), {}),
                 )
             )
         except AuthenticationError:

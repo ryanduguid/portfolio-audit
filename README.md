@@ -41,6 +41,10 @@ and workflow filenames to `v` or `component/v` version prefixes. It covers all
 18 release callers, whose tag-push runs carry the publish jobs. Other workflows
 retain default-branch collection.
 
+Repository names match policy regardless of capitalisation. Workflow filenames
+and package paths remain case-sensitive, and reports retain GitHub's repository
+spelling.
+
 For those workflows, the collector also reads the latest 100 completed
 workflow runs and considers matching version tags from push, release and manual
 dispatch events. It checks the latest eligible tag against the run's repository

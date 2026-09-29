@@ -1080,16 +1080,18 @@ class CollectorTests(unittest.TestCase):
             ({"release.yml": "v"}, {"release.yml": ReleaseComponent(("pkg",), "VERSION")}, 126),
         )
         for workflows, queued, remaining in cases:
-            with self.subTest(workflows=workflows, queued=queued):
-                policy = replace(
-                    small_policy(), tagged_release_workflows={"example": workflows},
-                    release_components={"example": queued} if queued else {},
-                )
-                transport = FakeTransport([api_response([public_repo()], remaining=remaining)])
-                result = collect_estate(policy, GitHubClient("token", transport=transport))
-                self.assertEqual(result.repositories, ())
-                self.assertEqual([problem.code for problem in result.problems], ["GITHUB_RATE_LIMITED"])
-                self.assertEqual(len(transport.requests), 1)
+            for policy_name in ("example", "EXAMPLE"):
+                with self.subTest(workflows=workflows, queued=queued, policy_name=policy_name):
+                    policy = replace(
+                        small_policy(), expected_repositories=(policy_name,),
+                        tagged_release_workflows={policy_name: workflows},
+                        release_components={policy_name: queued} if queued else {},
+                    )
+                    transport = FakeTransport([api_response([public_repo()], remaining=remaining)])
+                    result = collect_estate(policy, GitHubClient("token", transport=transport))
+                    self.assertEqual(result.repositories, ())
+                    self.assertEqual([problem.code for problem in result.problems], ["GITHUB_RATE_LIMITED"])
+                    self.assertEqual(len(transport.requests), 1)
 
     def test_inactive_tagged_workflows_do_not_reserve_requests(self) -> None:
         policy = replace(small_policy(), tagged_release_workflows={"archive": {"release.yml": "v"}})
@@ -1622,6 +1624,9 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
         deferrals: dict[str, dict[str, ReleaseDeferral]] | None = None,
         tag_commit: object = None,
         now: datetime = datetime(2026, 9, 20, tzinfo=UTC),
+        policy_name: str = "example",
+        repository_name: str = "example",
+        workflow_name: str = "release.yml",
     ) -> tuple[AuditReport, FakeTransport]:
         if tags is None:
             tags = [
@@ -1631,6 +1636,10 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
             ]
         if release_runs is None:
             release_runs = [{**workflow_run(20, branch="v0.1.10"), "head_sha": self.TAG_SHA}]
+        release_runs = [
+            {**run, "head_repository": {"full_name": f"ryanduguid/{repository_name}"}}
+            for run in release_runs
+        ]
         if tag_commit is None:
             tag_commit = {"sha": self.TAG_SHA, "committer": {"date": "2026-09-10T00:00:00Z"}}
         contents = {**self.FILES, **(files or {})}
@@ -1651,9 +1660,9 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
                 self.requests.append((url, headers))
                 parsed = urlsplit(url)
                 query = parse_qs(parsed.query)
-                base = "/repos/ryanduguid/example"
+                base = f"/repos/ryanduguid/{repository_name}"
                 if parsed.path == "/users/ryanduguid/repos":
-                    return api_response([public_repo()])
+                    return api_response([public_repo(repository_name)])
                 if parsed.path == base + "/git/trees/main":
                     return api_response({"truncated": False, "tree": tree})
                 if parsed.hostname == "raw.githubusercontent.com":
@@ -1684,9 +1693,9 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
 
         transport = RoutingTransport()
         policy = replace(
-            small_policy(), expected_repositories=("example",),
-            tagged_release_workflows={"example": {"release.yml": "v"}},
-            release_components={"example": {"release.yml": ReleaseComponent(paths, version_file)}},
+            small_policy(), expected_repositories=(policy_name,),
+            tagged_release_workflows={policy_name: {workflow_name: "v"}},
+            release_components={policy_name: {workflow_name: ReleaseComponent(paths, version_file)}},
             release_deferrals=deferrals or {},
         )
         result = collect_estate(policy, GitHubClient("TOKEN-SENTINEL", transport=transport))
@@ -1698,6 +1707,45 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
             (item.severity, item.code, item.summary, item.url) for item in report.findings
             if item.code.startswith("RELEASE_")
         ]
+
+    def test_repository_case_does_not_hide_release_findings(self) -> None:
+        for policy_name, repository_name in (("EXAMPLE", "example"), ("example", "Example")):
+            with self.subTest(policy_name=policy_name, repository_name=repository_name):
+                report, transport = self.audit(
+                    {"pkg": [package_commit("d" * 40, "2026-09-11T00:00:00Z")]},
+                    version_file="VERSION", files={"VERSION": "0.2.0\n"},
+                    release_runs=[{**workflow_run(20, branch="v0.1.10", conclusion="failure"),
+                                   "head_sha": self.TAG_SHA}],
+                    policy_name=policy_name, repository_name=repository_name,
+                )
+                self.assertEqual(report.status, AuditStatus.ACTION_REQUIRED)
+                self.assertEqual(report.collection_errors, ())
+                self.assertEqual({item.code for item in report.findings}, {
+                    "RELEASE_CHANGES_UNRELEASED", "RELEASE_VERSION_UNTAGGED", "WORKFLOW_RUN_FAILED",
+                })
+                self.assertTrue(all(item.repository == repository_name for item in report.findings))
+                self.assertTrue(all(f"/{repository_name}/" in item.url for item in report.findings))
+                self.assertTrue(any("/contents/VERSION?" in url for url, _ in transport.requests))
+
+    def test_repository_case_preserves_missing_release_evidence(self) -> None:
+        report, _ = self.audit({}, paths=("PKG",), policy_name="EXAMPLE")
+        self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+        self.assertEqual([item.code for item in report.collection_errors], ["RELEASE_PATH_MISSING"])
+
+    def test_repository_case_does_not_make_workflow_paths_case_insensitive(self) -> None:
+        report, _ = self.audit({}, workflow_name="Release.yml", policy_name="EXAMPLE")
+        self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+        self.assertEqual([item.code for item in report.collection_errors], ["GITHUB_RESPONSE_INVALID"])
+
+    def test_repository_case_preserves_release_deferrals(self) -> None:
+        report, transport = self.audit(
+            {"pkg": [package_commit("d" * 40, "2026-09-11T00:00:00Z")]},
+            version_file="VERSION", files={"VERSION": "0.2.0\n"}, policy_name="EXAMPLE",
+            deferrals={"EXAMPLE": {"release.yml": ReleaseDeferral("pending review", date(2026, 9, 20))}},
+        )
+        self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
+        self.assertEqual(report.findings, ())
+        self.assertTrue(any("/contents/VERSION?" in url for url, _ in transport.requests))
 
     def test_package_changes_waiting_past_the_limit_are_flagged_from_the_latest_version(self) -> None:
         report, transport = self.audit({"pkg": [
