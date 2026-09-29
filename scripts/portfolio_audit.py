@@ -52,6 +52,10 @@ FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TAG_PREFIX_RE = re.compile(r"(?:[a-z0-9]+(?:-[a-z0-9]+)*/)?v")
 VERSION_SUFFIX_RE = r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 PR_EVENTS = frozenset({"pull_request", "pull_request_target", "merge_group"})
+# A workflow triggered only by workflow_call runs as part of its callers' runs,
+# and one that can also be dispatched by hand has no run of its own to expect.
+REUSABLE_TRIGGERS = frozenset({"workflow_call"})
+MANUAL_TRIGGERS = frozenset({"workflow_call", "workflow_dispatch"})
 FAILED_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "action_required", "startup_failure", "stale"}
 )
@@ -103,6 +107,10 @@ class RateLimitError(ApiError):
 
 
 class ResponseError(ApiError):
+    pass
+
+
+class NotFoundError(ResponseError):
     pass
 
 
@@ -745,6 +753,8 @@ class GitHubClient:
             raise RateLimitError("GitHub API rate limit was reached")
         if response.status == 403:
             raise AuthorisationError("GitHub installation was not authorised for this resource")
+        if response.status == 404:
+            raise NotFoundError("GitHub API resource was not found")
         if not 200 <= response.status < 300:
             raise ResponseError("GitHub API returned an unexpected response")
 
@@ -877,6 +887,42 @@ def _is_workflow_file(path: str) -> bool:
         and path.lower().endswith((".yml", ".yaml"))
         and len(path.split("/")) == 3
     )
+
+
+def _workflow_triggers(source: str) -> frozenset[str] | None:
+    """The event names under a workflow's top-level on key, or None when unreadable."""
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        key = next(
+            (key for key in ("on", '"on"', "'on'")
+             if line.startswith(key) and line[len(key):].lstrip(" \t").startswith(":")),
+            None,
+        )
+        if key is None:
+            continue
+        value = line[len(key):].lstrip(" \t")[1:].split("#", 1)[0].strip()
+        if value.startswith("[") and value.endswith("]"):
+            return frozenset(
+                item.strip().strip("\"'") for item in value[1:-1].split(",") if item.strip()
+            )
+        if value:
+            return None if value.startswith("{") else frozenset({value.strip("\"'")})
+        events: set[str] = set()
+        indent: int | None = None
+        for child in lines[index + 1:]:
+            stripped = child.split("#", 1)[0].strip()
+            if not stripped:
+                continue
+            width = len(child) - len(child.lstrip(" "))
+            if width == 0:
+                break
+            if indent is None:
+                indent = width
+            if width == indent:
+                name = stripped[2:] if stripped.startswith("- ") else stripped.split(":", 1)[0]
+                events.add(name.strip().strip("\"'"))
+        return frozenset(events) or None
+    return None
 
 
 def _quote_component(value: str) -> str:
@@ -1352,6 +1398,31 @@ def _collect_repository(
         run = _collect_tagged_release_run(repository_path, workflow, prefix, client, tags)
         if run is not None:
             workflow_runs += (run,)
+    # A busy repository's latest 100 runs can leave out a scheduled or manual
+    # workflow and hide its failure, so a workflow missing from them is looked up
+    # by name. Reusable workflows run inside their callers' runs, and tagged
+    # release workflows were collected above.
+    collected = {run.path for run in workflow_runs}
+    for workflow_path, source in sorted(workflow_sources.items()):
+        workflow = workflow_path.removeprefix(WORKFLOW_PREFIX)
+        triggers = _workflow_triggers(source)
+        if (
+            workflow_path in collected
+            or workflow in tagged_release_workflows
+            or (triggers is not None and triggers <= REUSABLE_TRIGGERS)
+        ):
+            continue
+        try:
+            response = client.get_json(
+                f"{repository_path}/actions/workflows/{_quote_component(workflow)}/runs",
+                {"branch": default_branch, "status": "completed", "per_page": 100},
+            )
+        except NotFoundError:
+            # GitHub can keep a renamed workflow under its old filename; the new
+            # one then has no run to find, which the evaluation reports.
+            continue
+        latest = _normalise_runs(response, default_branch=default_branch)
+        workflow_runs += tuple(run for run in latest if run.path == workflow_path)[:1]
     release_backlogs = []
     for workflow, component in release_components.items():
         # A mistyped path would match no commit and hide the backlog it was meant to show.
@@ -1697,6 +1768,9 @@ def evaluate(
             )
 
         for workflow_path in workflow_paths:
+            triggers = _workflow_triggers(repository.workflow_sources.get(workflow_path, ""))
+            if triggers is not None and triggers <= REUSABLE_TRIGGERS:
+                continue
             run = next(
                 (
                     item
@@ -1707,12 +1781,14 @@ def evaluate(
             )
             source_url = _source_url(policy.owner, repository, workflow_path)
             if run is None:
+                if triggers is not None and triggers <= MANUAL_TRIGGERS:
+                    continue
                 findings.append(
                     Finding(
                         Severity.NOTICE,
                         repository.name,
                         "WORKFLOW_NO_RECENT_RUN",
-                        "workflow had no run in the latest 100 completed runs",
+                        "workflow has no completed run on the default branch",
                         source_url,
                     )
                 )

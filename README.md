@@ -44,6 +44,13 @@ Creation time orders results, so a rerun of an older release cannot hide a newer
 failure. A newer default-branch failure still takes precedence. Failed eligible
 runs remain action findings; cancelled, skipped and neutral runs remain notices.
 
+Default-branch collection reads the latest 100 completed runs. A workflow
+missing from them is looked up by name, so a busy repository cannot hide a
+scheduled workflow's failure. A workflow triggered only by `workflow_call` runs
+inside its callers' runs, so the audit neither looks it up nor expects a run of
+its own. One that can otherwise only be dispatched by hand raises no notice when
+it has no run, but its latest failure still counts.
+
 ## Release queue
 
 The optional `release_queue` policy lists, for each tagged release workflow, the
