@@ -43,7 +43,8 @@ retain default-branch collection.
 
 Repository names match policy regardless of capitalisation. Workflow filenames
 and package paths remain case-sensitive, and reports retain GitHub's repository
-spelling.
+spelling. Release-policy pins are approved for the exact workflow filename;
+case-distinct filenames keep separate approved commit lists.
 
 For those workflows, the collector also reads the latest 100 completed
 workflow runs and considers matching version tags from push, release and manual

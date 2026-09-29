@@ -141,6 +141,19 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.expected_repositories, (".github", "example"))
         self.assertEqual(policy.dependabot_max_age_days, 14)
 
+    def test_release_policy_pin_families_preserve_case(self) -> None:
+        raw = valid_policy_dict()
+        pins = {
+            "release-python.yml": ["3b8a377207cab2c7c808fcc96b66578f4695beea"],
+            "Release-Python.yml": ["47480b782926179b621ec1c6643ef88c80fc8fd4"],
+        }
+        raw["release_policy_pins"] = pins
+        policy = load_policy(self.write_policy(raw))
+        self.assertEqual(
+            policy.release_policy_pins,
+            {family: frozenset(values) for family, values in pins.items()},
+        )
+
     def test_rejects_unknown_top_level_key(self) -> None:
         raw = valid_policy_dict()
         raw["unexpected"] = True
@@ -2041,6 +2054,86 @@ class EvaluationTests(unittest.TestCase):
         unapproved_codes = {finding.code for finding in evaluate(small_policy(), collection(snapshot(workflow_source=unapproved)), self.now)}
         self.assertIn("RELEASE_POLICY_PIN_MALFORMED", malformed_codes)
         self.assertIn("RELEASE_POLICY_PIN_UNAPPROVED", unapproved_codes)
+
+    def test_release_policy_owner_and_repository_case_are_equivalent(self) -> None:
+        pin = "3b8a377207cab2c7c808fcc96b66578f4695beea"
+        for repository in (
+            "ryanduguid/release-policy",
+            "RyanDuguid/release-policy",
+            "ryanduguid/Release-Policy",
+            "RYANDUGUID/RELEASE-POLICY",
+        ):
+            with self.subTest(repository=repository):
+                source = (
+                    f"jobs:\n  release:\n    uses : '{repository}/"
+                    f".github/workflows/release-python.yml@{pin}' # reviewed\n"
+                )
+                findings = evaluate(
+                    small_policy(), collection(snapshot(workflow_source=source)), self.now
+                )
+                self.assertEqual(
+                    [item.code for item in findings if item.code.startswith("RELEASE_POLICY_PIN_")],
+                    [],
+                )
+
+    def test_release_policy_path_and_key_case_mismatches_are_malformed(self) -> None:
+        pin = "3b8a377207cab2c7c808fcc96b66578f4695beea"
+        for key, path in (
+            ("uses", ".GITHUB/workflows/release-python.yml"),
+            ("uses", ".github/WORKFLOWS/release-python.yml"),
+            ("uses", ".github/workflows/release-python.YML"),
+            ("Uses", ".github/workflows/release-python.yml"),
+            ("USES", ".github/workflows/release-python.yml"),
+        ):
+            with self.subTest(key=key, path=path):
+                source = f"jobs:\n  release:\n    {key}: ryanduguid/release-policy/{path}@{pin}\n"
+                findings = evaluate(
+                    small_policy(), collection(snapshot(workflow_source=source)), self.now
+                )
+                self.assertEqual(
+                    [item.code for item in findings if item.code.startswith("RELEASE_POLICY_PIN_")],
+                    ["RELEASE_POLICY_PIN_MALFORMED"],
+                )
+
+    def test_release_policy_filename_cannot_borrow_a_different_case_allowance(self) -> None:
+        pin = "3b8a377207cab2c7c808fcc96b66578f4695beea"
+        source = (
+            "jobs:\n  release:\n    uses: ryanduguid/release-policy/"
+            f".github/workflows/Release-Python.yml@{pin}\n"
+        )
+        findings = evaluate(
+            small_policy(), collection(snapshot(workflow_source=source)), self.now
+        )
+        self.assertEqual(
+            [item.code for item in findings if item.code.startswith("RELEASE_POLICY_PIN_")],
+            ["RELEASE_POLICY_PIN_UNAPPROVED"],
+        )
+
+    def test_release_policy_case_distinct_families_keep_separate_pins(self) -> None:
+        entries = (
+            ("release-python.yml", "3b8a377207cab2c7c808fcc96b66578f4695beea"),
+            ("Release-Python.yml", "47480b782926179b621ec1c6643ef88c80fc8fd4"),
+        )
+        for order in (entries, entries[::-1]):
+            policy = replace(
+                small_policy(),
+                release_policy_pins={family: frozenset({pin}) for family, pin in order},
+            )
+            for family, approved in entries:
+                for _, pin in entries:
+                    with self.subTest(order=order, family=family, pin=pin):
+                        source = (
+                            "jobs:\n  release:\n    uses: ryanduguid/release-policy/"
+                            f".github/workflows/{family}@{pin}\n"
+                        )
+                        findings = evaluate(
+                            policy, collection(snapshot(workflow_source=source)), self.now
+                        )
+                        self.assertEqual(
+                            [item.code for item in findings
+                             if item.code.startswith("RELEASE_POLICY_PIN_")],
+                            [] if pin == approved else ["RELEASE_POLICY_PIN_UNAPPROVED"],
+                        )
 
     def test_release_policy_does_not_audit_its_own_signer_identity_as_a_consumer_pin(self) -> None:
         repository = RepositorySnapshot(

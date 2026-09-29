@@ -64,14 +64,12 @@ ALLOWED_CONCLUSIONS = FAILED_CONCLUSIONS | NOTICE_CONCLUSIONS | {"success"}
 RELEASE_POLICY_PATH = "ryanduguid/release-policy/.github/workflows/"
 RELEASE_POLICY_USES_LINE_RE = re.compile(
     r"^\s*(?:-\s*)?uses\s*:\s*(?P<value>.*?)\s*$",
-    re.IGNORECASE,
 )
 RELEASE_POLICY_VALUE_RE = re.compile(
     r"^(?P<quote>[\"']?)"
-    r"ryanduguid/release-policy/\.github/workflows/"
+    r"(?i:ryanduguid/release-policy)/\.github/workflows/"
     r"(?P<family>[A-Za-z0-9._-]+\.ya?ml)@"
     r"(?P<pin>[^\s\"'#]+)(?P=quote)(?:[ \t]+#.*)?[ \t]*$",
-    re.IGNORECASE,
 )
 # `gh attestation verify --signer-workflow <path>` names the workflow whose
 # identity signed an attestation. It is not a workflow reference: it carries no
@@ -1720,10 +1718,6 @@ def evaluate(
     dependabot_exemptions = {
         repository.casefold() for repository in policy.dependabot_exemptions
     }
-    approved_pins = {
-        family.casefold(): pins
-        for family, pins in policy.release_policy_pins.items()
-    }
     stale_threshold = timedelta(days=policy.dependabot_max_age_days)
     release_max_age = timedelta(days=policy.release_max_age_days)
     release_deferrals = {
@@ -1894,7 +1888,7 @@ def evaluate(
                 if match is None or FULL_SHA_RE.fullmatch(match.group("pin")) is None:
                     malformed = True
                     continue
-                pins = approved_pins.get(match.group("family").casefold())
+                pins = policy.release_policy_pins.get(match.group("family"))
                 if pins is None or match.group("pin") not in pins:
                     unapproved = True
             if malformed:
@@ -1903,7 +1897,8 @@ def evaluate(
                         Severity.ACTION,
                         repository.name,
                         "RELEASE_POLICY_PIN_MALFORMED",
-                        "release-policy reference did not use a full lowercase commit SHA",
+                        "release-policy reference has unsupported syntax or lacks "
+                        "a full lowercase commit SHA",
                         source_url,
                     )
                 )
