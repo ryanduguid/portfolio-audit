@@ -173,6 +173,22 @@ rotate it, run a dry audit and inspect the report before re-enabling delivery.
 Reports contain public metadata only: do not add private repository, client,
 taxpayer, payroll or credential data.
 
+## Scope compared with similar tools
+
+This audit checks how the repositories operate, not how they present:
+default-branch and release-tag workflow results, release tags against declared
+versions, the release queue, stale Dependabot pull requests and pinned uses of
+the release-policy workflows. Two public tools cover neighbouring ground (read
+on 29 September 2026):
+
+- [OpenSSF Scorecard](https://github.com/ossf/scorecard) scores security
+  practices. It already runs in release-policy's `scorecard.yml` workflow.
+- [Samielakkad/github-portfolio-audit](https://github.com/Samielakkad/github-portfolio-audit)
+  (MIT) scores whether public repositories are documented, testable, licensed,
+  maintained and discoverable, from the description, topics, README, licence,
+  workflow triggers, test files and community policies. This audit makes none
+  of those presentation checks.
+
 ## Licence
 
 MIT licensed. See [LICENSE](LICENSE).
