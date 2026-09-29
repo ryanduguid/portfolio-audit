@@ -2553,6 +2553,141 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("SENSITIVE-BODY-SENTINEL", first_json + render_text(report))
 
 
+class OutputPathTests(unittest.TestCase):
+    def test_writer_rejects_shared_and_relative_output_paths(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        clean = collection(snapshot())
+        report = build_report(small_policy(), clean, (), now, now)
+        for relative in (False, True):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "audit.out"
+                output.write_text("existing report", encoding="utf-8")
+                (root / "child").mkdir()
+                other = root / "child" / ".." / output.name if relative else output
+                with self.assertRaises(ValueError):
+                    write_outputs(report, output, other)
+                self.assertEqual(output.read_text(encoding="utf-8"), "existing report")
+
+    def test_cli_rejects_output_and_policy_collisions_without_writing(self) -> None:
+        for collision in ("outputs", "json-policy", "text-policy"):
+            with self.subTest(collision=collision), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                policy, json_path, text_path = root / "policy.json", root / "audit.json", root / "audit.txt"
+                policy.write_text("fabricated policy", encoding="utf-8")
+                if collision == "outputs":
+                    text_path = json_path
+                    json_path.write_text("existing report", encoding="utf-8")
+                elif collision == "json-policy":
+                    json_path = policy
+                else:
+                    text_path = policy
+                with patch("scripts.portfolio_audit.GitHubClient") as client:
+                    code = main([
+                        "--policy", str(policy), "--json-output", str(json_path),
+                        "--text-output", str(text_path),
+                    ], environ={})
+                client.assert_not_called()
+                self.assertEqual(code, 2)
+                self.assertEqual(policy.read_text(encoding="utf-8"), "fabricated policy")
+                if collision == "outputs":
+                    self.assertEqual(json_path.read_text(encoding="utf-8"), "existing report")
+                else:
+                    other = text_path if collision == "json-policy" else json_path
+                    self.assertFalse(other.exists())
+
+    def test_writer_rejects_directory_symlink_aliases(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        clean = collection(snapshot())
+        report = build_report(small_policy(), clean, (), now, now)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            alias = root / "alias"
+            try:
+                alias.symlink_to(root, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Cannot create a local directory symlink: {error}")
+            output = root / "audit.out"
+            output.write_text("existing report", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                write_outputs(report, output, alias / output.name)
+            self.assertEqual(output.read_text(encoding="utf-8"), "existing report")
+
+    def test_cli_rejects_resolved_policy_aliases(self) -> None:
+        for alias_kind in ("policy link", "policy chain", "output link", "parent link"):
+            for output_kind in ("json", "text"):
+                with (
+                    self.subTest(alias=alias_kind, output=output_kind),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    target = root / "policy.json"
+                    target.write_text("fabricated policy", encoding="utf-8")
+                    policy, output = target, target
+                    try:
+                        if alias_kind in ("policy link", "policy chain"):
+                            policy = root / "policy-link.json"
+                            if alias_kind == "policy chain":
+                                output = root / "middle-link.json"
+                                output.symlink_to(target)
+                            policy.symlink_to(output)
+                        elif alias_kind == "output link":
+                            output = root / "output-link.json"
+                            output.symlink_to(target)
+                        else:
+                            alias = root / "alias"
+                            alias.symlink_to(root, target_is_directory=True)
+                            output = alias / target.name
+                    except OSError as error:
+                        self.skipTest(f"Cannot create a local symlink: {error}")
+                    other = root / "other-report"
+                    json_path, text_path = (output, other) if output_kind == "json" else (other, output)
+                    code = main([
+                        "--policy", str(policy), "--json-output", str(json_path),
+                        "--text-output", str(text_path),
+                    ], environ={})
+                    self.assertEqual(code, 2)
+                    self.assertEqual(target.read_text(encoding="utf-8"), "fabricated policy")
+                    self.assertEqual(policy.read_text(encoding="utf-8"), "fabricated policy")
+                    self.assertFalse(other.exists())
+
+    def test_separate_hard_links_remain_safe_report_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, json_path, text_path = root / "policy.json", root / "audit.json", root / "audit.txt"
+            policy.write_text("fabricated policy", encoding="utf-8")
+            try:
+                json_path.hardlink_to(policy)
+                text_path.hardlink_to(policy)
+            except OSError as error:
+                self.skipTest(f"Cannot create local hard links: {error}")
+            code = main([
+                "--policy", str(policy), "--json-output", str(json_path),
+                "--text-output", str(text_path),
+            ], environ={})
+            self.assertEqual(code, 0)
+            self.assertEqual(policy.read_text(encoding="utf-8"), "fabricated policy")
+            self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["status"], "INCOMPLETE")
+            self.assertIn("INCOMPLETE", text_path.read_text(encoding="utf-8"))
+
+    def test_unresolvable_paths_prevent_both_writes(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        clean = collection(snapshot())
+        report = build_report(small_policy(), clean, (), now, now)
+        with (
+            patch.object(Path, "resolve", side_effect=OSError("fabricated resolution failure")),
+            patch("scripts.portfolio_audit._atomic_write") as writer,
+        ):
+            with self.assertRaises(OSError):
+                write_outputs(report, Path("audit.json"), Path("audit.txt"))
+            code = main([
+                "--policy", "policy.json", "--json-output", "audit.json",
+                "--text-output", "audit.txt",
+            ], environ={})
+            self.assertEqual(code, 2)
+        writer.assert_not_called()
+
+
 class CliTests(unittest.TestCase):
     def test_missing_token_writes_incomplete_outputs_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -2030,7 +2030,13 @@ def _atomic_write(path: Path, value: str) -> None:
         raise
 
 
+def _require_distinct_paths(*paths: Path) -> None:
+    if len({path.resolve(strict=False) for path in paths}) != len(paths):
+        raise ValueError("File paths must resolve to distinct locations")
+
+
 def write_outputs(report: AuditReport, json_path: Path, text_path: Path) -> None:
+    _require_distinct_paths(json_path, text_path)
     failure: OSError | ValueError | None = None
     for path, value in (
         (json_path, render_json(report)),
@@ -2111,6 +2117,14 @@ def main(
         # argparse always exits with an integer status. Treat anything else as
         # the usage-error code rather than raising from the error handler.
         return error.code if isinstance(error.code, int) else 2
+
+    try:
+        _require_distinct_paths(
+            arguments.policy, arguments.json_output, arguments.text_output
+        )
+    except (OSError, ValueError):
+        print("Policy and report paths must be resolvable and distinct.", file=sys.stderr)
+        return 2
 
     fixed_time: datetime | None = arguments.now
     started_at = fixed_time if fixed_time is not None else datetime.now(UTC)

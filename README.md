@@ -25,6 +25,13 @@ on the operator-controlled audit workflow being enabled.
 The delivery artefact contains report data only; the delivery job runs its mail
 code from the immutable triggering commit with checkout credentials disabled.
 
+The policy, JSON report and text report must use distinct resolved paths. The
+CLI refuses collisions before collection or writing, including aliases through
+relative paths or symbolic links. Separate hard-link paths remain usable because
+atomic replacement creates separate report files. An ordinary write failure still
+allows the other report to be written. The path check does not protect against
+another process changing filesystem links during the run.
+
 The collector keeps default-branch workflow checks separate from release-tag
 evidence. It excludes pull-request and merge-group events from default-branch
 results. The optional `tagged_release_workflows` policy maps repository names
