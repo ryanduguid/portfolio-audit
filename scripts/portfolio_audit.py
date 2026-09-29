@@ -2030,6 +2030,22 @@ def _atomic_write(path: Path, value: str) -> None:
         raise
 
 
+def _require_distinct_paths(*paths: Path) -> None:
+    if os.name == "nt":
+        for path in paths:
+            if str(path).startswith(("\\\\?\\", "\\\\.\\")) or any(
+                part not in (path.anchor, "..") and part.endswith((".", " "))
+                for part in path.parts
+            ):
+                raise ValueError("Windows paths must use unambiguous ordinary names")
+    try:
+        resolved = {path.resolve(strict=False) for path in paths}
+    except RuntimeError as error:
+        raise ValueError("File paths cannot contain symlink loops") from error
+    if len(resolved) != len(paths):
+        raise ValueError("File paths must resolve to distinct locations")
+
+
 def write_outputs(report: AuditReport, json_path: Path, text_path: Path) -> None:
     failure: OSError | ValueError | None = None
     for path, value in (
@@ -2037,6 +2053,7 @@ def write_outputs(report: AuditReport, json_path: Path, text_path: Path) -> None
         (text_path, render_text(report)),
     ):
         try:
+            _require_distinct_paths(json_path, text_path)
             _atomic_write(path, value)
         except (OSError, ValueError) as error:
             if failure is None:
@@ -2111,6 +2128,14 @@ def main(
         # argparse always exits with an integer status. Treat anything else as
         # the usage-error code rather than raising from the error handler.
         return error.code if isinstance(error.code, int) else 2
+
+    try:
+        _require_distinct_paths(
+            arguments.policy, arguments.json_output, arguments.text_output
+        )
+    except (OSError, ValueError):
+        print("Policy and report paths must be unambiguous, resolvable and distinct.", file=sys.stderr)
+        return 2
 
     fixed_time: datetime | None = arguments.now
     started_at = fixed_time if fixed_time is not None else datetime.now(UTC)
