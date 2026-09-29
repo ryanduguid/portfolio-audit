@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -2554,6 +2555,66 @@ class RenderingTests(unittest.TestCase):
 
 
 class OutputPathTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows path aliases")
+    def test_cli_rejects_ambiguous_windows_paths_before_writing(self) -> None:
+        for spelling in ("extended", "device", "trailing dot", "trailing space"):
+            for argument in ("policy", "json-output", "text-output"):
+                with (
+                    self.subTest(spelling=spelling, argument=argument),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    policy = root / "policy.json"
+                    policy.write_text("fabricated policy", encoding="utf-8")
+                    paths = {
+                        "policy": str(policy),
+                        "json-output": str(root / "audit.json"),
+                        "text-output": str(root / "audit.txt"),
+                    }
+                    if spelling in ("extended", "device"):
+                        prefix = "\\\\?\\" if spelling == "extended" else "\\\\.\\"
+                        paths[argument] = prefix + paths[argument]
+                    else:
+                        paths[argument] += "." if spelling == "trailing dot" else " "
+                    arguments = [item for name, path in paths.items() for item in ("--" + name, path)]
+                    self.assertEqual(main(arguments, environ={}), 2)
+                    self.assertEqual(policy.read_text(encoding="utf-8"), "fabricated policy")
+                    self.assertFalse((root / "audit.json").exists())
+                    self.assertFalse((root / "audit.txt").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows path aliases")
+    def test_writer_rejects_windows_aliases_for_new_outputs(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        report = build_report(small_policy(), collection(snapshot()), (), now, now)
+        for spelling in ("extended", "trailing dot", "trailing space"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "audit.out"
+                alias = (
+                    Path("\\\\?\\" + str(output)) if spelling == "extended"
+                    else Path(str(output) + ("." if spelling == "trailing dot" else " "))
+                )
+                with self.assertRaises(ValueError):
+                    write_outputs(report, output, alias)
+                self.assertFalse(output.exists())
+
+    def test_writer_rejects_separate_symlinks_to_one_target(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        report = build_report(small_policy(), collection(snapshot()), (), now, now)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "existing.out"
+            target.write_text("existing report", encoding="utf-8")
+            first, second = root / "first.out", root / "second.out"
+            try:
+                first.symlink_to(target)
+                second.symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"Cannot create local symlinks: {error}")
+            with self.assertRaises(ValueError):
+                write_outputs(report, first, second)
+            self.assertTrue(first.is_symlink() and second.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "existing report")
+
     def test_writer_rejects_shared_and_relative_output_paths(self) -> None:
         now = datetime(2026, 8, 26, 12, tzinfo=UTC)
         clean = collection(snapshot())
@@ -2823,16 +2884,20 @@ class CliTests(unittest.TestCase):
                 self.assertNotIn("SENSITIVE-EVALUATION-SENTINEL", json_text + text_text)
 
     def test_atomic_output_failure_returns_two(self) -> None:
-        exit_code = main(
-            [
-                "--policy", "portfolio-audit-policy.json",
-                "--json-output", ".",
-                "--text-output", ".",
-                "--now", "2026-08-26T12:00:00Z",
-            ],
-            environ={},
-        )
-        self.assertEqual(exit_code, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = Path(directory) / "first", Path(directory) / "second"
+            first.mkdir()
+            second.mkdir()
+            exit_code = main(
+                [
+                    "--policy", "portfolio-audit-policy.json",
+                    "--json-output", str(first),
+                    "--text-output", str(second),
+                    "--now", "2026-08-26T12:00:00Z",
+                ],
+                environ={},
+            )
+            self.assertEqual(exit_code, 2)
 
     def test_output_failure_still_attempts_the_other_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

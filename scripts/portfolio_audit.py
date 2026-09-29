@@ -2031,6 +2031,13 @@ def _atomic_write(path: Path, value: str) -> None:
 
 
 def _require_distinct_paths(*paths: Path) -> None:
+    if os.name == "nt":
+        for path in paths:
+            if str(path).startswith(("\\\\?\\", "\\\\.\\")) or any(
+                part not in (path.anchor, "..") and part.endswith((".", " "))
+                for part in path.parts
+            ):
+                raise ValueError("Windows paths must use unambiguous ordinary names")
     if len({path.resolve(strict=False) for path in paths}) != len(paths):
         raise ValueError("File paths must resolve to distinct locations")
 
@@ -2123,7 +2130,7 @@ def main(
             arguments.policy, arguments.json_output, arguments.text_output
         )
     except (OSError, ValueError):
-        print("Policy and report paths must be resolvable and distinct.", file=sys.stderr)
+        print("Policy and report paths must be unambiguous, resolvable and distinct.", file=sys.stderr)
         return 2
 
     fixed_time: datetime | None = arguments.now

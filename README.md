@@ -28,7 +28,9 @@ code from the immutable triggering commit with checkout credentials disabled.
 The policy, JSON report and text report must use distinct resolved paths. The
 CLI refuses collisions before collection or writing, including aliases through
 relative paths or symbolic links. Separate hard-link paths remain usable because
-atomic replacement creates separate report files. An ordinary write failure still
+atomic replacement creates separate report files. On Windows, policy and report
+paths must use ordinary names: extended or device namespace prefixes and
+components ending in a dot or space are refused. An ordinary write failure still
 allows the other report to be written. The path check does not protect against
 another process changing filesystem links during the run.
 
