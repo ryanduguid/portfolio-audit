@@ -43,6 +43,7 @@ from scripts.portfolio_audit import (
     UrllibTransport,
     WorkflowRun,
     _normalise_runs,
+    _workflow_triggers,
     build_report,
     collect_estate,
     evaluate,
@@ -547,7 +548,7 @@ def repository_tree_transport(
                 )
             if url.startswith("https://raw.githubusercontent.com/"):
                 return HttpResponse(200, {}, raw)
-            if "/actions/runs" in url:
+            if "/actions/runs" in url or "/actions/workflows/" in url:
                 return api_response({"workflow_runs": []})
             if "/pulls" in url:
                 return api_response([])
@@ -1270,6 +1271,31 @@ class CollectorTests(unittest.TestCase):
             "DEPENDABOT_BASELINE_MISSING", {finding.code for finding in findings}
         )
 
+    def test_only_workflows_with_runs_of_their_own_are_looked_up_by_name(self) -> None:
+        for raw, looked_up in (
+            (b"name: Shared\non:\n  workflow_call:\njobs: {}\n", False),
+            (b"name: Manual\non: workflow_dispatch\njobs: {}\n", True),
+        ):
+            with self.subTest(raw=raw):
+                transport = repository_tree_transport(
+                    [
+                        {"path": ".github/workflows/w.yml", "type": "blob", "sha": blob_sha(raw)},
+                        {"path": ".github/dependabot.yml", "type": "blob", "sha": "dependabot-sha"},
+                    ],
+                    raw=raw,
+                )
+                policy = replace(small_policy(), expected_repositories=("example",))
+
+                result = collect_estate(policy, GitHubClient("token", transport=transport))
+                findings = evaluate(policy, result, datetime(2026, 8, 26, tzinfo=UTC))
+
+                self.assertEqual(result.problems, ())
+                self.assertEqual(
+                    any("/actions/workflows/w.yml/runs?" in url for url, _ in transport.requests),
+                    looked_up,
+                )
+                self.assertNotIn("WORKFLOW_NO_RECENT_RUN", {finding.code for finding in findings})
+
 
 def workflow_run(
     run_id: int, *, path: str = ".github/workflows/release.yml",
@@ -1292,6 +1318,7 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
         heads: object = (), tag_response: HttpResponse | None = None,
         extra_tag_response: HttpResponse | None = None,
         configured: bool = True, remaining: int = 4999,
+        older_runs: tuple[dict[str, object], ...] = (),
     ) -> tuple[AuditReport, FakeTransport]:
         if main_runs is None:
             main_runs = [workflow_run(
@@ -1301,6 +1328,7 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
             tags = [{"name": prefix + "0.1.5", "commit": {"sha": "a" * 40}}]
         if heads == ():
             heads = []
+        lookup_runs = [*main_runs, *older_runs]
         source = b"name: Release\non:\n  push:\n    tags: ['v*']\njobs: {}\n"
         tree = [
             {"path": path, "type": "blob", "sha": blob_sha(source)}
@@ -1326,6 +1354,14 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
                     if query != {"branch": ["main"], "status": ["completed"], "per_page": ["100"]}:
                         raise AssertionError("default-branch query changed")
                     return api_response({"workflow_runs": main_runs})
+                if parsed.path.startswith(base + "/actions/workflows/") and query == {
+                    "branch": ["main"], "status": ["completed"], "per_page": ["1"]
+                }:
+                    # A workflow missing from the latest runs is looked up by name;
+                    # older_runs fell out of the latest 100.
+                    name = parsed.path.removeprefix(base + "/actions/workflows/").removesuffix("/runs")
+                    own = [run for run in lookup_runs if run["path"] == ".github/workflows/" + name]
+                    return api_response({"workflow_runs": own[:1]})
                 if parsed.path == base + "/actions/workflows/release.yml/runs":
                     if query != {"status": ["completed"], "per_page": ["100"]}:
                         raise AssertionError("tagged workflow query changed")
@@ -1366,6 +1402,18 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
         failures = [item for item in report.findings if item.code == "WORKFLOW_RUN_FAILED"]
         self.assertEqual(report.status, AuditStatus.ACTION_REQUIRED)
         self.assertEqual([item.url for item in failures], ["https://github.com/ryanduguid/example/actions/runs/20"])
+
+    def test_failure_outside_the_latest_runs_is_found_by_workflow_name(self) -> None:
+        ci = ".github/workflows/ci.yml"
+        report, transport = self.audit(
+            [workflow_run(20)], main_runs=[],
+            older_runs=(workflow_run(5, path=ci, branch="main", conclusion="failure"),),
+        )
+        failures = [item for item in report.findings if item.code == "WORKFLOW_RUN_FAILED"]
+        lookups = [url for url, _ in transport.requests if parse_qs(urlsplit(url).query).get("per_page") == ["1"]]
+        self.assertEqual([item.url for item in failures], ["https://github.com/ryanduguid/example/actions/runs/5"])
+        self.assertEqual(len(lookups), 1)
+        self.assertIn("/actions/workflows/ci.yml/runs?branch=main&", lookups[0])
 
     def test_new_main_failure_is_not_hidden_by_older_tag_success(self) -> None:
         report, _ = self.audit(
@@ -1476,7 +1524,11 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
     def test_unconfigured_workflow_keeps_default_branch_policy(self) -> None:
         report, transport = self.audit([workflow_run(20)], configured=False)
         self.assertEqual(report.status, AuditStatus.ACTION_REQUIRED)
-        self.assertFalse(any("/tags" in url or "/actions/workflows/" in url for url, _ in transport.requests))
+        # Only default-branch lookups: no tag listing and no tagged-release run query.
+        self.assertFalse(any(
+            "/tags" in url or ("/actions/workflows/" in url and "branch=main" not in url)
+            for url, _ in transport.requests
+        ))
 
     def test_minimum_reserved_capacity_allows_collection(self) -> None:
         # One configured workflow adds its run query, up to 10 tag pages and
@@ -1778,6 +1830,31 @@ def small_policy() -> Policy:
     )
 
 
+class WorkflowTriggerTests(unittest.TestCase):
+    def test_reads_top_level_trigger_forms(self) -> None:
+        cases = (
+            ("on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: '0 0 * * 1'\njobs: {}\n", {"push", "schedule"}),
+            ("on:\n  - push\n  - workflow_dispatch\n", {"push", "workflow_dispatch"}),
+            ("on: workflow_call # shared\n", {"workflow_call"}),
+            ('on: [push, "workflow_dispatch"]\n', {"push", "workflow_dispatch"}),
+            ('"on": # triggers\n  # none yet\n  workflow_call:\n    inputs: {}\njobs: {}\n', {"workflow_call"}),
+            ("'on' :\n  workflow_dispatch:\n", {"workflow_dispatch"}),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(_workflow_triggers(source), frozenset(expected))
+
+    def test_unreadable_or_missing_triggers_are_none(self) -> None:
+        for source in (
+            "on: {push: {}}\n",
+            "on:\njobs: {}\n",
+            "only: push\njobs:\n  a:\n    on: push\n",
+            WORKFLOW.decode(),
+        ):
+            with self.subTest(source=source):
+                self.assertIsNone(_workflow_triggers(source))
+
+
 def snapshot(
     *,
     workflow_source: str = "",
@@ -1840,6 +1917,26 @@ class EvaluationTests(unittest.TestCase):
         self.assertIn("WORKFLOW_RUN_FAILED", {finding.code for finding in findings})
         absent = evaluate(small_policy(), collection(snapshot()), self.now)
         self.assertIn("WORKFLOW_NO_RECENT_RUN", {finding.code for finding in absent})
+
+    def test_absent_run_notice_skips_workflows_without_runs_of_their_own(self) -> None:
+        cases = (
+            ("on:\n  workflow_call:\n", False),
+            ("on: [workflow_call, workflow_dispatch]\n", False),
+            ("on:\n  schedule:\n    - cron: '0 0 * * 1'\n  workflow_dispatch:\n", True),
+            ("name: Unreadable\non: {push: {}}\n", True),
+        )
+        for source, notice in cases:
+            with self.subTest(source=source):
+                findings = evaluate(small_policy(), collection(snapshot(workflow_source=source)), self.now)
+                self.assertEqual("WORKFLOW_NO_RECENT_RUN" in {item.code for item in findings}, notice)
+
+    def test_manual_only_workflow_failure_is_still_reported(self) -> None:
+        failed = snapshot(
+            workflow_source="on: workflow_dispatch\n",
+            runs=(WorkflowRun(42, ".github/workflows/release.yml", "failure"),),
+        )
+        findings = evaluate(small_policy(), collection(failed), self.now)
+        self.assertIn("WORKFLOW_RUN_FAILED", {finding.code for finding in findings})
 
     def test_dependabot_age_is_strictly_greater_than_fourteen_days(self) -> None:
         boundary = DependabotPullRequest(7, self.now - timedelta(days=14))
