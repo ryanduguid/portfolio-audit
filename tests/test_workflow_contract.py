@@ -460,6 +460,12 @@ class BaselineConfigTests(unittest.TestCase):
                         "directory": "/",
                         "schedule": {"interval": "weekly"},
                         "cooldown": {"default-days": "7"},
+                        "groups": {
+                            "codeql-action": {"patterns": ["github/codeql-action*"]}
+                        },
+                        "ignore": [
+                            {"dependency-name": "ryanduguid/release-policy/.github/workflows/*"}
+                        ],
                     }
                 ],
             },
