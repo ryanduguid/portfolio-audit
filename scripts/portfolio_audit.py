@@ -110,6 +110,10 @@ class ResponseError(ApiError):
     pass
 
 
+class NotFoundError(ResponseError):
+    pass
+
+
 class SafetyLimitError(ApiError):
     pass
 
@@ -749,6 +753,8 @@ class GitHubClient:
             raise RateLimitError("GitHub API rate limit was reached")
         if response.status == 403:
             raise AuthorisationError("GitHub installation was not authorised for this resource")
+        if response.status == 404:
+            raise NotFoundError("GitHub API resource was not found")
         if not 200 <= response.status < 300:
             raise ResponseError("GitHub API returned an unexpected response")
 
@@ -904,8 +910,8 @@ def _workflow_triggers(source: str) -> frozenset[str] | None:
         events: set[str] = set()
         indent: int | None = None
         for child in lines[index + 1:]:
-            stripped = child.strip()
-            if not stripped or stripped.startswith("#"):
+            stripped = child.split("#", 1)[0].strip()
+            if not stripped:
                 continue
             width = len(child) - len(child.lstrip(" "))
             if width == 0:
@@ -1406,13 +1412,16 @@ def _collect_repository(
             or (triggers is not None and triggers <= REUSABLE_TRIGGERS)
         ):
             continue
-        latest = _normalise_runs(
-            client.get_json(
+        try:
+            response = client.get_json(
                 f"{repository_path}/actions/workflows/{_quote_component(workflow)}/runs",
-                {"branch": default_branch, "status": "completed", "per_page": 1},
-            ),
-            default_branch=default_branch,
-        )
+                {"branch": default_branch, "status": "completed", "per_page": 100},
+            )
+        except NotFoundError:
+            # GitHub can keep a renamed workflow under its old filename; the new
+            # one then has no run to find, which the evaluation reports.
+            continue
+        latest = _normalise_runs(response, default_branch=default_branch)
         workflow_runs += tuple(run for run in latest if run.path == workflow_path)[:1]
     release_backlogs = []
     for workflow, component in release_components.items():

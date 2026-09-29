@@ -533,6 +533,7 @@ def repository_tree_transport(
     tree: list[dict[str, object]],
     *,
     raw: bytes = WORKFLOW,
+    workflow_lookup: HttpResponse | None = None,
 ) -> FakeTransport:
     class RoutingTransport(FakeTransport):
         def __init__(self) -> None:
@@ -548,6 +549,8 @@ def repository_tree_transport(
                 )
             if url.startswith("https://raw.githubusercontent.com/"):
                 return HttpResponse(200, {}, raw)
+            if "/actions/workflows/" in url and workflow_lookup is not None:
+                return workflow_lookup
             if "/actions/runs" in url or "/actions/workflows/" in url:
                 return api_response({"workflow_runs": []})
             if "/pulls" in url:
@@ -1296,6 +1299,26 @@ class CollectorTests(unittest.TestCase):
                 )
                 self.assertNotIn("WORKFLOW_NO_RECENT_RUN", {finding.code for finding in findings})
 
+    def test_workflow_unknown_to_github_by_name_has_no_run(self) -> None:
+        # GitHub can keep a renamed workflow under its old filename and answer 404 for the new one.
+        raw = b"name: Weekly\non:\n  schedule:\n    - cron: '0 0 * * 1'\njobs: {}\n"
+        transport = repository_tree_transport(
+            [
+                {"path": ".github/workflows/w.yml", "type": "blob", "sha": blob_sha(raw)},
+                {"path": ".github/dependabot.yml", "type": "blob", "sha": "dependabot-sha"},
+            ],
+            raw=raw,
+            workflow_lookup=HttpResponse(404, {}, b'{"message": "Not Found"}'),
+        )
+        policy = replace(small_policy(), expected_repositories=("example",))
+
+        result = collect_estate(policy, GitHubClient("token", transport=transport))
+        findings = evaluate(policy, result, datetime(2026, 8, 26, tzinfo=UTC))
+
+        self.assertEqual(result.problems, ())
+        self.assertEqual(len(result.repositories), 1)
+        self.assertIn("WORKFLOW_NO_RECENT_RUN", {finding.code for finding in findings})
+
 
 def workflow_run(
     run_id: int, *, path: str = ".github/workflows/release.yml",
@@ -1354,14 +1377,14 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
                     if query != {"branch": ["main"], "status": ["completed"], "per_page": ["100"]}:
                         raise AssertionError("default-branch query changed")
                     return api_response({"workflow_runs": main_runs})
-                if parsed.path.startswith(base + "/actions/workflows/") and query == {
-                    "branch": ["main"], "status": ["completed"], "per_page": ["1"]
-                }:
+                if parsed.path.startswith(base + "/actions/workflows/") and query.get("branch") == ["main"]:
                     # A workflow missing from the latest runs is looked up by name;
                     # older_runs fell out of the latest 100.
+                    if set(query) != {"branch", "status", "per_page"} or query["status"] != ["completed"]:
+                        raise AssertionError("workflow lookup query changed")
                     name = parsed.path.removeprefix(base + "/actions/workflows/").removesuffix("/runs")
                     own = [run for run in lookup_runs if run["path"] == ".github/workflows/" + name]
-                    return api_response({"workflow_runs": own[:1]})
+                    return api_response({"workflow_runs": own[:int(query["per_page"][0])]})
                 if parsed.path == base + "/actions/workflows/release.yml/runs":
                     if query != {"status": ["completed"], "per_page": ["100"]}:
                         raise AssertionError("tagged workflow query changed")
@@ -1410,10 +1433,22 @@ class TaggedReleaseCollectorTests(unittest.TestCase):
             older_runs=(workflow_run(5, path=ci, branch="main", conclusion="failure"),),
         )
         failures = [item for item in report.findings if item.code == "WORKFLOW_RUN_FAILED"]
-        lookups = [url for url, _ in transport.requests if parse_qs(urlsplit(url).query).get("per_page") == ["1"]]
+        lookups = [url for url, _ in transport.requests if "/actions/workflows/" in url and "branch=main" in url]
         self.assertEqual([item.url for item in failures], ["https://github.com/ryanduguid/example/actions/runs/5"])
         self.assertEqual(len(lookups), 1)
         self.assertIn("/actions/workflows/ci.yml/runs?branch=main&", lookups[0])
+
+    def test_lookup_passes_pull_request_runs_to_reach_an_older_failure(self) -> None:
+        ci = ".github/workflows/ci.yml"
+        report, _ = self.audit(
+            [workflow_run(20)], main_runs=[],
+            older_runs=(
+                workflow_run(6, path=ci, branch="main", event="pull_request", created="2026-09-02T13:00:00Z"),
+                workflow_run(5, path=ci, branch="main", conclusion="failure", created="2026-09-01T13:00:00Z"),
+            ),
+        )
+        failures = [item for item in report.findings if item.code == "WORKFLOW_RUN_FAILED"]
+        self.assertEqual([item.url for item in failures], ["https://github.com/ryanduguid/example/actions/runs/5"])
 
     def test_new_main_failure_is_not_hidden_by_older_tag_success(self) -> None:
         report, _ = self.audit(
@@ -1835,6 +1870,7 @@ class WorkflowTriggerTests(unittest.TestCase):
         cases = (
             ("on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: '0 0 * * 1'\njobs: {}\n", {"push", "schedule"}),
             ("on:\n  - push\n  - workflow_dispatch\n", {"push", "workflow_dispatch"}),
+            ("on:\n  - workflow_call # shared\n  - workflow_dispatch  # by hand\n", {"workflow_call", "workflow_dispatch"}),
             ("on: workflow_call # shared\n", {"workflow_call"}),
             ('on: [push, "workflow_dispatch"]\n', {"push", "workflow_dispatch"}),
             ('"on": # triggers\n  # none yet\n  workflow_call:\n    inputs: {}\njobs: {}\n', {"workflow_call"}),
