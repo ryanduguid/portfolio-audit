@@ -2038,7 +2038,11 @@ def _require_distinct_paths(*paths: Path) -> None:
                 for part in path.parts
             ):
                 raise ValueError("Windows paths must use unambiguous ordinary names")
-    if len({path.resolve(strict=False) for path in paths}) != len(paths):
+    try:
+        resolved = {path.resolve(strict=False) for path in paths}
+    except RuntimeError as error:
+        raise ValueError("File paths cannot contain symlink loops") from error
+    if len(resolved) != len(paths):
         raise ValueError("File paths must resolve to distinct locations")
 
 

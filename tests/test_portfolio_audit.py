@@ -2768,6 +2768,22 @@ class OutputPathTests(unittest.TestCase):
             self.assertEqual(code, 2)
         writer.assert_not_called()
 
+    def test_legacy_symlink_loop_is_reported_as_a_path_error(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        report = build_report(small_policy(), collection(snapshot()), (), now, now)
+        with (
+            patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop")),
+            patch("scripts.portfolio_audit._atomic_write") as writer,
+        ):
+            with self.assertRaises(ValueError):
+                write_outputs(report, Path("audit.json"), Path("audit.txt"))
+            code = main([
+                "--policy", "policy.json", "--json-output", "audit.json",
+                "--text-output", "audit.txt",
+            ], environ={})
+            self.assertEqual(code, 2)
+        writer.assert_not_called()
+
 
 class CliTests(unittest.TestCase):
     def test_missing_token_writes_incomplete_outputs_without_network(self) -> None:
