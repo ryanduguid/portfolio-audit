@@ -2043,13 +2043,13 @@ def _require_distinct_paths(*paths: Path) -> None:
 
 
 def write_outputs(report: AuditReport, json_path: Path, text_path: Path) -> None:
-    _require_distinct_paths(json_path, text_path)
     failure: OSError | ValueError | None = None
     for path, value in (
         (json_path, render_json(report)),
         (text_path, render_text(report)),
     ):
         try:
+            _require_distinct_paths(json_path, text_path)
             _atomic_write(path, value)
         except (OSError, ValueError) as error:
             if failure is None:

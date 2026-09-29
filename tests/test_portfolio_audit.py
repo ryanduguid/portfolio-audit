@@ -2555,6 +2555,26 @@ class RenderingTests(unittest.TestCase):
 
 
 class OutputPathTests(unittest.TestCase):
+    def test_writer_rechecks_aliases_created_by_the_first_output(self) -> None:
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        report = build_report(small_policy(), collection(snapshot()), (), now, now)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, alias = root / "long-report.json", root / "short-alias.json"
+            resolve = Path.resolve
+
+            def resolve_created_alias(path, strict=False):
+                # Model a filesystem alias that exists only after its target is created.
+                if path == alias and output.exists():
+                    return resolve(output, strict=strict)
+                return resolve(path, strict=strict)
+
+            with patch.object(Path, "resolve", resolve_created_alias):
+                with self.assertRaises(ValueError):
+                    write_outputs(report, output, alias)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["status"], "ALL_CLEAR")
+            self.assertFalse(alias.exists())
+
     @unittest.skipUnless(os.name == "nt", "Windows path aliases")
     def test_cli_rejects_ambiguous_windows_paths_before_writing(self) -> None:
         for spelling in ("extended", "device", "trailing dot", "trailing space"):
