@@ -1347,6 +1347,7 @@ def _collect_repository(
     problems: list[CollectionProblem],
     tagged_release_workflows: Mapping[str, str],
     release_components: Mapping[str, ReleaseComponent],
+    workflow_blob_cache: dict[str, str],
 ) -> RepositorySnapshot:
     owner_component = _quote_component(owner)
     repository_component = _quote_component(name)
@@ -1370,6 +1371,9 @@ def _collect_repository(
         problems.append(_problem("WORKFLOW_COUNT_EXCEEDED", name))
     else:
         for workflow_path, expected_sha in workflow_blobs:
+            if expected_sha in workflow_blob_cache:
+                workflow_sources[workflow_path] = workflow_blob_cache[expected_sha]
+                continue
             raw_url = (
                 "https://raw.githubusercontent.com/"
                 f"{owner_component}/{repository_component}/{branch_component}/"
@@ -1384,9 +1388,12 @@ def _collect_repository(
                 problems.append(_problem("RAW_WORKFLOW_MISMATCH", name))
                 continue
             try:
-                workflow_sources[workflow_path] = source_bytes.decode("utf-8")
+                source = source_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 problems.append(_problem("RAW_WORKFLOW_INVALID_UTF8", name))
+                continue
+            workflow_blob_cache[expected_sha] = source
+            workflow_sources[workflow_path] = source
 
     workflow_runs = _normalise_runs(
         client.get_json(
@@ -1534,6 +1541,7 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
         problems.append(_problem("GITHUB_RATE_LIMITED"))
         return _result(client, discovered, problems=problems)
 
+    workflow_blob_cache: dict[str, str] = {}
     repositories: list[RepositorySnapshot] = []
     for name, default_branch in active_repositories:
         try:
@@ -1542,6 +1550,7 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
                     policy.owner, name, default_branch, client, problems,
                     tagged_by_repository.get(name.casefold(), {}),
                     components_by_repository.get(name.casefold(), {}),
+                    workflow_blob_cache,
                 )
             )
         except AuthenticationError:

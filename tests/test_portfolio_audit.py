@@ -958,6 +958,143 @@ class WorkflowRunNormalisationTests(unittest.TestCase):
                 }
             )
 
+class WorkflowCacheTests(unittest.TestCase):
+    SOURCE = b"on: workflow_call\njobs: {}\n"
+
+    def transport(
+        self,
+        sources: dict[str, bytes] | None = None,
+        responses: dict[str, HttpResponse] | None = None,
+        *,
+        beta_workflows: int = 1,
+        beta_remaining: int = 4999,
+    ) -> FakeTransport:
+        expected = sources or {"alpha": self.SOURCE, "beta": self.SOURCE}
+        raw = responses or {}
+
+        class RoutingTransport(FakeTransport):
+            def __init__(self) -> None:
+                super().__init__([])
+
+            def request(self, url: str, headers: dict[str, str]) -> HttpResponse:
+                self.requests.append((url, headers))
+                if "/users/ryanduguid/repos" in url:
+                    return api_response([public_repo("beta"), public_repo("alpha")])
+                parsed = urlsplit(url)
+                name = parsed.path.split("/")[2 if parsed.netloc == "raw.githubusercontent.com" else 3]
+                if "/git/trees/" in url:
+                    count = beta_workflows if name == "beta" else 1
+                    return api_response({"sha": "tree-sha", "truncated": False, "tree": [
+                        {"path": f".github/workflows/{name}{index}.yml",
+                         "type": "blob", "sha": blob_sha(expected[name])}
+                        for index in range(count)
+                    ]}, remaining=beta_remaining if name == "beta" else 4999)
+                if url.startswith("https://raw.githubusercontent.com/"):
+                    return raw.get(name, HttpResponse(200, {}, expected[name]))
+                if "/actions/runs" in url or "/actions/workflows/" in url:
+                    return api_response({"workflow_runs": []})
+                if "/pulls" in url:
+                    return api_response([])
+                raise AssertionError(f"unexpected request URL: {url}")
+
+        return RoutingTransport()
+
+    def collect(self, transport: FakeTransport) -> CollectionResult:
+        return collect_estate(small_policy(), GitHubClient("token", transport=transport))
+
+    def raw_urls(self, transport: FakeTransport) -> list[str]:
+        return [url for url, _headers in transport.requests
+                if url.startswith("https://raw.githubusercontent.com/")]
+
+    def test_identical_blobs_use_one_fetch_and_keep_each_repository_path(self) -> None:
+        transport = self.transport()
+        result = self.collect(transport)
+        self.assertEqual(result.problems, ())
+        self.assertEqual(len(self.raw_urls(transport)), 1)
+        for repository in result.repositories:
+            self.assertEqual(repository.workflow_sources, {
+                f".github/workflows/{repository.name}0.yml": self.SOURCE.decode()
+            })
+
+    def test_distinct_blobs_are_fetched_separately(self) -> None:
+        transport = self.transport({"alpha": self.SOURCE, "beta": self.SOURCE + b"# beta\n"})
+        result = self.collect(transport)
+        self.assertEqual(result.problems, ())
+        self.assertEqual(len(self.raw_urls(transport)), 2)
+        self.assertTrue(result.repositories[1].workflow_sources[".github/workflows/beta0.yml"].endswith("# beta\n"))
+
+    def test_empty_verified_blob_is_cached(self) -> None:
+        transport = self.transport({"alpha": b"", "beta": b""})
+        result = self.collect(transport)
+        self.assertEqual(result.problems, ())
+        self.assertEqual(len(self.raw_urls(transport)), 1)
+        self.assertEqual(result.repositories[1].workflow_sources, {".github/workflows/beta0.yml": ""})
+
+    def test_failed_first_fetch_is_retried_and_remains_incomplete(self) -> None:
+        for response, code in (
+            (HttpResponse(500, {}, b"unavailable"), "RAW_WORKFLOW_REQUEST_FAILED"),
+            (HttpResponse(200, {}, b"moved content"), "RAW_WORKFLOW_MISMATCH"),
+            (HttpResponse(200, {}, b"x" * (MAX_RAW_WORKFLOW_BYTES + 1)), "RAW_WORKFLOW_REQUEST_FAILED"),
+        ):
+            with self.subTest(code=code, status=response.status):
+                transport = self.transport(responses={"alpha": response})
+                result = self.collect(transport)
+                self.assertEqual(len(self.raw_urls(transport)), 2)
+                self.assertEqual([(p.repository, p.code) for p in result.problems], [("alpha", code)])
+                self.assertEqual(result.repositories[0].workflow_sources, {})
+                self.assertEqual(result.repositories[1].workflow_sources, {".github/workflows/beta0.yml": self.SOURCE.decode()})
+                when = datetime(2026, 10, 3, tzinfo=UTC)
+                report = build_report(small_policy(), result, (), when, when)
+                self.assertEqual(report.status, AuditStatus.INCOMPLETE)
+
+    def test_invalid_utf8_is_never_cached(self) -> None:
+        transport = self.transport({"alpha": b"\xff", "beta": b"\xff"})
+        result = self.collect(transport)
+        self.assertEqual(len(self.raw_urls(transport)), 2)
+        self.assertEqual([(p.repository, p.code) for p in result.problems], [
+            ("alpha", "RAW_WORKFLOW_INVALID_UTF8"), ("beta", "RAW_WORKFLOW_INVALID_UTF8")
+        ])
+        self.assertTrue(all(not repository.workflow_sources for repository in result.repositories))
+
+    def test_each_collection_fetches_its_own_verified_blob(self) -> None:
+        transport = self.transport()
+        first = self.collect(transport)
+        second = self.collect(transport)
+        self.assertEqual(first.repositories, second.repositories)
+        self.assertEqual(len(self.raw_urls(transport)), 2)
+
+    def test_workflow_count_limit_is_checked_before_reusing_a_blob(self) -> None:
+        transport = self.transport(beta_workflows=3)
+        with patch("scripts.portfolio_audit.MAX_WORKFLOWS_PER_REPOSITORY", 2):
+            result = self.collect(transport)
+        self.assertEqual(len(self.raw_urls(transport)), 1)
+        self.assertEqual([(p.repository, p.code) for p in result.problems], [("beta", "WORKFLOW_COUNT_EXCEEDED")])
+        self.assertEqual(result.repositories[1].workflow_sources, {})
+
+    def test_cache_hit_saves_one_request_without_changing_other_evidence(self) -> None:
+        shared = self.collect(self.transport())
+        distinct = self.collect(self.transport({"alpha": self.SOURCE, "beta": self.SOURCE + b"# beta\n"}))
+        self.assertEqual(shared.request_count + 1, distinct.request_count)
+        self.assertEqual(shared.discovered_repositories, distinct.discovered_repositories)
+        self.assertEqual(shared.problems, distinct.problems)
+        for before, after in zip(shared.repositories, distinct.repositories):
+            self.assertEqual(before.workflow_runs, after.workflow_runs)
+            self.assertEqual(before.dependabot_pull_requests, after.dependabot_pull_requests)
+
+    def test_cache_miss_respects_the_request_ceiling(self) -> None:
+        transport = self.transport({"alpha": self.SOURCE, "beta": self.SOURCE + b"# beta\n"})
+        result = collect_estate(small_policy(), GitHubClient("token", transport=transport, max_requests=6))
+        self.assertEqual(result.request_count, 6)
+        self.assertEqual(len(self.raw_urls(transport)), 1)
+        self.assertEqual([p.code for p in result.problems], ["REQUEST_SAFETY_LIMIT"])
+
+    def test_cache_miss_respects_rate_headroom(self) -> None:
+        transport = self.transport({"alpha": self.SOURCE, "beta": self.SOURCE + b"# beta\n"}, beta_remaining=100)
+        result = self.collect(transport)
+        self.assertEqual(len(self.raw_urls(transport)), 1)
+        self.assertEqual([p.code for p in result.problems], ["GITHUB_RATE_LIMITED"])
+
+
 class CollectorTests(unittest.TestCase):
     def test_collects_only_normalised_public_evidence(self) -> None:
         transport = collection_transport()

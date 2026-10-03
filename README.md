@@ -41,6 +41,14 @@ and workflow filenames to `v` or `component/v` version prefixes. It covers all
 18 release callers, whose tag-push runs carry the publish jobs. Other workflows
 retain default-branch collection.
 
+Within one collection, workflow paths whose authenticated tree entries share a
+Git blob SHA reuse the same verified UTF-8 content. The first fetch must pass
+the response-size and blob-identity checks. Failed fetches are retried at later
+paths and remain collection problems. Each path retains its own repository
+identity; reuse establishes its content, without checking that every raw URL is
+available. The cache is discarded after collection. Workflow-count limits,
+request ceilings and rate headroom still apply.
+
 Repository names match policy regardless of capitalisation. Workflow filenames
 and package paths remain case-sensitive, and reports retain GitHub's repository
 spelling. Release-policy pins are approved for the exact workflow filename;
