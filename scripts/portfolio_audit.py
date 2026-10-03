@@ -243,6 +243,7 @@ class ReleaseComponent:
 
 @dataclass(frozen=True)
 class ReleaseDeferral:
+    version: str
     reason: str
     review_by: date
 
@@ -463,7 +464,10 @@ def _require_release_queue(
         for workflow, entry in workflows.items():
             if workflow not in components.get(repository, {}) or not isinstance(entry, dict):
                 raise PolicyError("release deferral must name a queued release workflow")
-            _require_exact_keys(entry, {"reason", "review_by"}, "release deferral")
+            _require_exact_keys(entry, {"version", "reason", "review_by"}, "release deferral")
+            version = entry["version"]
+            if not isinstance(version, str) or re.fullmatch(VERSION_SUFFIX_RE, version) is None:
+                raise PolicyError("release deferral needs an unprefixed version")
             reason, review_by = entry["reason"], entry["review_by"]
             if not isinstance(reason, str) or not reason.strip():
                 raise PolicyError("release deferral needs a reason")
@@ -471,9 +475,11 @@ def _require_release_queue(
                 raise PolicyError("release deferral needs a YYYY-MM-DD review date")
             try:
                 review = date.fromisoformat(review_by)
+                if review.isoformat() != review_by:
+                    raise ValueError("Noncanonical date")
             except ValueError:
                 raise PolicyError("release deferral needs a YYYY-MM-DD review date") from None
-            deferrals[repository][workflow] = ReleaseDeferral(reason.strip(), review)
+            deferrals[repository][workflow] = ReleaseDeferral(version, reason.strip(), review)
     return max_age, components, deferrals
 
 
@@ -490,9 +496,9 @@ def load_policy(path: Path) -> Policy:
     if (
         not isinstance(raw["schema_version"], int)
         or isinstance(raw["schema_version"], bool)
-        or raw["schema_version"] != 1
+        or raw["schema_version"] != 2
     ):
-        raise PolicyError("policy schema version must be 1")
+        raise PolicyError("policy schema version must be 2; migrate release deferrals to include version")
     if raw["owner"] != "ryanduguid":
         raise PolicyError("policy owner must be ryanduguid")
 
@@ -1341,6 +1347,7 @@ def _collect_repository(
     problems: list[CollectionProblem],
     tagged_release_workflows: Mapping[str, str],
     release_components: Mapping[str, ReleaseComponent],
+    workflow_blob_cache: dict[str, str],
 ) -> RepositorySnapshot:
     owner_component = _quote_component(owner)
     repository_component = _quote_component(name)
@@ -1364,6 +1371,9 @@ def _collect_repository(
         problems.append(_problem("WORKFLOW_COUNT_EXCEEDED", name))
     else:
         for workflow_path, expected_sha in workflow_blobs:
+            if expected_sha in workflow_blob_cache:
+                workflow_sources[workflow_path] = workflow_blob_cache[expected_sha]
+                continue
             raw_url = (
                 "https://raw.githubusercontent.com/"
                 f"{owner_component}/{repository_component}/{branch_component}/"
@@ -1378,9 +1388,12 @@ def _collect_repository(
                 problems.append(_problem("RAW_WORKFLOW_MISMATCH", name))
                 continue
             try:
-                workflow_sources[workflow_path] = source_bytes.decode("utf-8")
+                source = source_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 problems.append(_problem("RAW_WORKFLOW_INVALID_UTF8", name))
+                continue
+            workflow_blob_cache[expected_sha] = source
+            workflow_sources[workflow_path] = source
 
     workflow_runs = _normalise_runs(
         client.get_json(
@@ -1528,6 +1541,7 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
         problems.append(_problem("GITHUB_RATE_LIMITED"))
         return _result(client, discovered, problems=problems)
 
+    workflow_blob_cache: dict[str, str] = {}
     repositories: list[RepositorySnapshot] = []
     for name, default_branch in active_repositories:
         try:
@@ -1536,6 +1550,7 @@ def collect_estate(policy: Policy, client: GitHubClient) -> CollectionResult:
                     policy.owner, name, default_branch, client, problems,
                     tagged_by_repository.get(name.casefold(), {}),
                     components_by_repository.get(name.casefold(), {}),
+                    workflow_blob_cache,
                 )
             )
         except AuthenticationError:
@@ -1845,7 +1860,8 @@ def evaluate(
                 )
                 continue
             deferral = repository_deferrals.get(backlog.workflow)
-            if deferral is not None and now.date() <= deferral.review_by:
+            if (deferral is not None and deferral.version == backlog.version
+                    and not backlog.version_tagged and now.date() <= deferral.review_by):
                 continue
             if not backlog.version_tagged:
                 findings.append(
@@ -1942,7 +1958,7 @@ def build_report(
         status = AuditStatus.ALL_CLEAR
 
     return AuditReport(
-        schema_version=policy.schema_version,
+        schema_version=1,
         owner=policy.owner,
         started_at=started_at,
         finished_at=finished_at,

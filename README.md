@@ -41,6 +41,14 @@ and workflow filenames to `v` or `component/v` version prefixes. It covers all
 18 release callers, whose tag-push runs carry the publish jobs. Other workflows
 retain default-branch collection.
 
+Within one collection, workflow paths whose authenticated tree entries share a
+Git blob SHA reuse the same verified UTF-8 content. The first fetch must pass
+the response-size and blob-identity checks. Failed fetches are retried at later
+paths and remain collection problems. Each path retains its own repository
+identity; reuse establishes its content, without checking that every raw URL is
+available. The cache is discarded after collection. Workflow-count limits,
+request ceilings and rate headroom still apply.
+
 Repository names match policy regardless of capitalisation. Workflow filenames
 and package paths remain case-sensitive, and reports retain GitHub's repository
 spelling. Release-policy pins are approved for the exact workflow filename;
@@ -90,8 +98,12 @@ action findings follow:
 A component without any matching tag is a `RELEASE_TAG_MISSING` notice. A
 configured path or version file missing from the tree reports
 `RELEASE_PATH_MISSING` and `INCOMPLETE`, because a mistyped path would match
-nothing and hide the backlog. A `deferrals` entry, with a `reason` and a
-`review_by` date, holds both findings for a component until that date passes.
+nothing and hide the backlog. Policy schema 2 requires each `deferrals` entry
+to name an exact unprefixed `version`, a `reason` and an inclusive `review_by`
+date. The hold suppresses both action findings only while that version is
+untagged. A tagged or different version cannot inherit it. Schema 1 policies
+fail with a migration message; add the version and change `schema_version` to 2.
+The audit-report schema remains 1.
 Committer dates stand in for ancestry, which holds for squash-merged histories.
 The queue adds about 2 requests per component plus one per package path. It
 compares versions with tags, not with PyPI: the tag run publishes, so a failed
