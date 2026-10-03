@@ -114,7 +114,7 @@ def public_repo(name: str = "example") -> dict[str, object]:
 
 def valid_policy_dict() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "owner": "ryanduguid",
         "expected_repositories": [".github", "example"],
         "baseline_exemptions": {"workflow": {}, "dependabot": {}},
@@ -289,7 +289,7 @@ class PolicyTests(unittest.TestCase):
             "components": {"example": {"release.yml": {
                 "paths": ["pkg", ".claude-plugin/plugin.json"], "version_file": "pkg/version.py",
             }}},
-            "deferrals": {"example": {"release.yml": {"reason": " preparing v1 ", "review_by": "2026-10-31"}}},
+            "deferrals": {"example": {"release.yml": {"version": "0.2.0", "reason": " preparing v1 ", "review_by": "2026-10-31"}}},
         }
         policy = load_policy(self.write_policy(raw))
         self.assertEqual(policy.release_max_age_days, 10)
@@ -299,8 +299,27 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             policy.release_deferrals,
-            {"example": {"release.yml": ReleaseDeferral("preparing v1", date(2026, 10, 31))}},
+            {"example": {"release.yml": ReleaseDeferral("0.2.0", "preparing v1", date(2026, 10, 31))}},
         )
+
+    def test_old_policy_requires_explicit_version_migration(self) -> None:
+        raw = valid_policy_dict()
+        raw["schema_version"] = 1
+        with self.assertRaisesRegex(PolicyError, "migrate release deferrals"):
+            load_policy(self.write_policy(raw))
+
+    def test_release_hold_requires_a_valid_unprefixed_version(self) -> None:
+        for version in (None, "", " ", True, "v0.3.1", "0.3", "latest"):
+            with self.subTest(version=version):
+                raw = valid_policy_dict()
+                raw["tagged_release_workflows"] = {"example": {"release.yml": "v"}}
+                raw["release_queue"] = {
+                    "max_age_days": 7,
+                    "components": {"example": {"release.yml": {"paths": ["pkg"], "version_file": "VERSION"}}},
+                    "deferrals": {"example": {"release.yml": {"version": version, "reason": "r", "review_by": "2026-10-31"}}},
+                }
+                with self.assertRaisesRegex(PolicyError, "unprefixed version"):
+                    load_policy(self.write_policy(raw))
 
     def test_rejects_malformed_release_queue(self) -> None:
         def queue(**changes: object) -> dict[str, object]:
@@ -334,8 +353,10 @@ class PolicyTests(unittest.TestCase):
             queue(deferrals={"example": {"publish.yml": {"reason": "r", "review_by": "2026-10-31"}}}),
             *(queue(deferrals={"example": {"release.yml": value}}) for value in (
                 "defer", {"reason": "r"}, {"reason": "r", "review_by": "2026-10-31", "extra": 1},
-                {"reason": " ", "review_by": "2026-10-31"}, {"reason": "r", "review_by": "31/10/2026"},
-                {"reason": "r", "review_by": "2026-02-30"}, {"reason": "r", "review_by": 20261031},
+                {"version": "0.2.0", "reason": " ", "review_by": "2026-10-31"}, {"version": "0.2.0", "reason": "r", "review_by": "31/10/2026"},
+                {"version": "0.2.0", "reason": "r", "review_by": "2026-02-30"}, {"version": "0.2.0", "reason": "r", "review_by": 20261031},
+                *({"version": "0.2.0", "reason": "r", "review_by": value} for value in
+                  ("20261031", "2026-W44-6", " 2026-10-31", "2026-10-31 ")),
             )),
         )
         for value in invalid:
@@ -1754,7 +1775,7 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
         report, transport = self.audit(
             {"pkg": [package_commit("d" * 40, "2026-09-11T00:00:00Z")]},
             version_file="VERSION", files={"VERSION": "0.2.0\n"}, policy_name="EXAMPLE",
-            deferrals={"EXAMPLE": {"release.yml": ReleaseDeferral("pending review", date(2026, 9, 20))}},
+            deferrals={"EXAMPLE": {"release.yml": ReleaseDeferral("0.2.0", "pending review", date(2026, 9, 20))}},
         )
         self.assertEqual(report.status, AuditStatus.ALL_CLEAR)
         self.assertEqual(report.findings, ())
@@ -1857,12 +1878,32 @@ class ReleaseQueueCollectorTests(unittest.TestCase):
             (date(2026, 9, 19), ["RELEASE_CHANGES_UNRELEASED", "RELEASE_VERSION_UNTAGGED"]),
         ):
             with self.subTest(review_by=review_by):
-                deferral = ReleaseDeferral("waiting on the v1 schema", review_by)
+                deferral = ReleaseDeferral("0.2.0", "waiting on the v1 schema", review_by)
                 report, _ = self.audit(
                     waiting, version_file="VERSION", files=bumped,
                     deferrals={"example": {"release.yml": deferral}},
                 )
                 self.assertEqual(sorted(item[1] for item in self.queue_findings(report)), codes)
+
+    def test_a_hold_does_not_cover_a_tagged_or_different_version(self) -> None:
+        waiting = {"pkg": [package_commit("d" * 40, "2026-09-11T00:00:00Z")]}
+        hold = ReleaseDeferral("0.3.0", "waiting for review", date(2026, 10, 13))
+        for version, codes in (
+            ("0.1.10", ["RELEASE_CHANGES_UNRELEASED"]),
+            ("0.3.0", []),
+            ("0.3.1", ["RELEASE_CHANGES_UNRELEASED", "RELEASE_VERSION_UNTAGGED"]),
+        ):
+            with self.subTest(version=version):
+                report, _ = self.audit(waiting, version_file="VERSION", files={"VERSION": version},
+                                       deferrals={"example": {"release.yml": hold}})
+                self.assertEqual(sorted(item[1] for item in self.queue_findings(report)), codes)
+
+    def test_a_matching_hold_does_not_suppress_changes_after_that_version_is_tagged(self) -> None:
+        hold = ReleaseDeferral("0.1.10", "waiting for review", date(2026, 10, 13))
+        report, _ = self.audit({"pkg": [package_commit("d" * 40, "2026-09-11T00:00:00Z")]},
+                               version_file="VERSION", files={"VERSION": "0.1.10"},
+                               deferrals={"example": {"release.yml": hold}})
+        self.assertEqual([item[1] for item in self.queue_findings(report)], ["RELEASE_CHANGES_UNRELEASED"])
 
     def test_a_component_without_a_release_tag_is_a_notice(self) -> None:
         report, transport = self.audit(
@@ -1913,7 +1954,7 @@ class BlobIntegrityTests(unittest.TestCase):
 
 def small_policy() -> Policy:
     return Policy(
-        schema_version=1,
+        schema_version=2,
         owner="ryanduguid",
         expected_repositories=("expected",),
         workflow_exemptions={},
@@ -2613,6 +2654,14 @@ class EvaluationTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_loaded_schema_two_policy_serialises_a_schema_one_report(self) -> None:
+        policy = load_policy(Path("portfolio-audit-policy.json"))
+        self.assertEqual(policy.schema_version, 2)
+        now = datetime(2026, 10, 3, tzinfo=UTC)
+        result = collection(snapshot())
+        report = build_report(policy, result, evaluate(policy, result, now), now, now)
+        self.assertEqual(json.loads(render_json(report))["schema_version"], 1)
+
     def test_complete_healthy_estate_is_all_clear(self) -> None:
         now = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
         source = "jobs:\n  release:\n    uses: ryanduguid/release-policy/.github/workflows/release-python.yml@3b8a377207cab2c7c808fcc96b66578f4695beea\n"

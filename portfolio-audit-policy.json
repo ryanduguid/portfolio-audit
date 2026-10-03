@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "owner": "ryanduguid",
   "expected_repositories": [
     ".github",
@@ -205,14 +205,7 @@
         }
       }
     },
-    "deferrals": {
-      "australian-accounting-skills": {
-        "release.yml": {
-          "reason": "v0.3.0 is in preparation on main; its closed evaluation run is due on or after 29 September 2026",
-          "review_by": "2026-10-13"
-        }
-      }
-    }
+    "deferrals": {}
   },
   "release_policy_pins": {
     "attribution-policy.yml": [

@@ -243,6 +243,7 @@ class ReleaseComponent:
 
 @dataclass(frozen=True)
 class ReleaseDeferral:
+    version: str
     reason: str
     review_by: date
 
@@ -463,7 +464,10 @@ def _require_release_queue(
         for workflow, entry in workflows.items():
             if workflow not in components.get(repository, {}) or not isinstance(entry, dict):
                 raise PolicyError("release deferral must name a queued release workflow")
-            _require_exact_keys(entry, {"reason", "review_by"}, "release deferral")
+            _require_exact_keys(entry, {"version", "reason", "review_by"}, "release deferral")
+            version = entry["version"]
+            if not isinstance(version, str) or re.fullmatch(VERSION_SUFFIX_RE, version) is None:
+                raise PolicyError("release deferral needs an unprefixed version")
             reason, review_by = entry["reason"], entry["review_by"]
             if not isinstance(reason, str) or not reason.strip():
                 raise PolicyError("release deferral needs a reason")
@@ -471,9 +475,11 @@ def _require_release_queue(
                 raise PolicyError("release deferral needs a YYYY-MM-DD review date")
             try:
                 review = date.fromisoformat(review_by)
+                if review.isoformat() != review_by:
+                    raise ValueError("Noncanonical date")
             except ValueError:
                 raise PolicyError("release deferral needs a YYYY-MM-DD review date") from None
-            deferrals[repository][workflow] = ReleaseDeferral(reason.strip(), review)
+            deferrals[repository][workflow] = ReleaseDeferral(version, reason.strip(), review)
     return max_age, components, deferrals
 
 
@@ -490,9 +496,9 @@ def load_policy(path: Path) -> Policy:
     if (
         not isinstance(raw["schema_version"], int)
         or isinstance(raw["schema_version"], bool)
-        or raw["schema_version"] != 1
+        or raw["schema_version"] != 2
     ):
-        raise PolicyError("policy schema version must be 1")
+        raise PolicyError("policy schema version must be 2; migrate release deferrals to include version")
     if raw["owner"] != "ryanduguid":
         raise PolicyError("policy owner must be ryanduguid")
 
@@ -1845,7 +1851,8 @@ def evaluate(
                 )
                 continue
             deferral = repository_deferrals.get(backlog.workflow)
-            if deferral is not None and now.date() <= deferral.review_by:
+            if (deferral is not None and deferral.version == backlog.version
+                    and not backlog.version_tagged and now.date() <= deferral.review_by):
                 continue
             if not backlog.version_tagged:
                 findings.append(
@@ -1942,7 +1949,7 @@ def build_report(
         status = AuditStatus.ALL_CLEAR
 
     return AuditReport(
-        schema_version=policy.schema_version,
+        schema_version=1,
         owner=policy.owner,
         started_at=started_at,
         finished_at=finished_at,

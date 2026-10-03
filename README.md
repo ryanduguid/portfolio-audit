@@ -90,8 +90,12 @@ action findings follow:
 A component without any matching tag is a `RELEASE_TAG_MISSING` notice. A
 configured path or version file missing from the tree reports
 `RELEASE_PATH_MISSING` and `INCOMPLETE`, because a mistyped path would match
-nothing and hide the backlog. A `deferrals` entry, with a `reason` and a
-`review_by` date, holds both findings for a component until that date passes.
+nothing and hide the backlog. Policy schema 2 requires each `deferrals` entry
+to name an exact unprefixed `version`, a `reason` and an inclusive `review_by`
+date. The hold suppresses both action findings only while that version is
+untagged. A tagged or different version cannot inherit it. Schema 1 policies
+fail with a migration message; add the version and change `schema_version` to 2.
+The audit-report schema remains 1.
 Committer dates stand in for ancestry, which holds for squash-merged histories.
 The queue adds about 2 requests per component plus one per package path. It
 compares versions with tags, not with PyPI: the tag run publishes, so a failed
